@@ -1,0 +1,57 @@
+[
+  {
+    "mode": "REQUIRED",
+    "name": "request_id",
+    "type": "STRING"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "batch_id",
+    "type": "STRING"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "ticker",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "as_of_date",
+    "type": "DATE"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "market_feature_date",
+    "type": "DATE"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "prediction",
+    "type": "STRING"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "confidence",
+    "type": "FLOAT"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "prob_up",
+    "type": "FLOAT"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "model_artifact_uri",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "model_trained_at",
+    "type": "TIMESTAMP"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "predicted_at",
+    "type": "TIMESTAMP"
+  }
+]

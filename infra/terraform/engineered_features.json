@@ -1,0 +1,120 @@
+[
+  {
+    "mode": "REQUIRED",
+    "name": "date",
+    "type": "DATE"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "ticker",
+    "type": "STRING"
+  },
+  {
+    "name": "return_1d",
+    "type": "FLOAT"
+  },
+  {
+    "name": "return_3d",
+    "type": "FLOAT"
+  },
+  {
+    "name": "return_5d",
+    "type": "FLOAT"
+  },
+  {
+    "name": "volatility_5d",
+    "type": "FLOAT"
+  },
+  {
+    "name": "volatility_10d",
+    "type": "FLOAT"
+  },
+  {
+    "name": "rsi_14",
+    "type": "FLOAT"
+  },
+  {
+    "name": "macd",
+    "type": "FLOAT"
+  },
+  {
+    "name": "macd_signal",
+    "type": "FLOAT"
+  },
+  {
+    "name": "macd_hist",
+    "type": "FLOAT"
+  },
+  {
+    "name": "bb_position",
+    "type": "FLOAT"
+  },
+  {
+    "name": "volume_ratio_5d",
+    "type": "FLOAT"
+  },
+  {
+    "name": "volume_ratio_10d",
+    "type": "FLOAT"
+  },
+  {
+    "name": "intraday_range",
+    "type": "FLOAT"
+  },
+  {
+    "name": "gap",
+    "type": "FLOAT"
+  },
+  {
+    "name": "price_vs_sma5",
+    "type": "FLOAT"
+  },
+  {
+    "name": "price_vs_sma10",
+    "type": "FLOAT"
+  },
+  {
+    "name": "obv_slope_5d",
+    "type": "FLOAT"
+  },
+  {
+    "name": "sentiment_mean",
+    "type": "FLOAT"
+  },
+  {
+    "name": "sentiment_max",
+    "type": "FLOAT"
+  },
+  {
+    "name": "sentiment_min",
+    "type": "FLOAT"
+  },
+  {
+    "name": "sentiment_std",
+    "type": "FLOAT"
+  },
+  {
+    "name": "sentiment_positive_ratio",
+    "type": "FLOAT"
+  },
+  {
+    "name": "sentiment_negative_ratio",
+    "type": "FLOAT"
+  },
+  {
+    "name": "news_count",
+    "type": "INTEGER"
+  },
+  {
+    "name": "sentiment_momentum",
+    "type": "FLOAT"
+  },
+  {
+    "name": "news_volume_ratio",
+    "type": "FLOAT"
+  },
+  {
+    "name": "target",
+    "type": "INTEGER"
+  }
+]

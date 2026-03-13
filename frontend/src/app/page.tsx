@@ -1,0 +1,1465 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import {
+  Activity,
+  AlertCircle,
+  ArrowDownRight,
+  ArrowUpRight,
+  BarChart3,
+  Brain,
+  Clock3,
+  Database,
+  Filter,
+  Gauge,
+  Loader2,
+  Newspaper,
+  Plus,
+  Search,
+  Sparkles,
+  TrendingDown,
+  TrendingUp,
+  X,
+} from "lucide-react";
+import { clsx } from "clsx";
+
+interface FeatureItem {
+  name: string;
+  label: string;
+  value: number | string | null;
+  source: string;
+  providers: string[];
+  raw_fields: string[];
+  fallback_used: boolean;
+}
+
+interface FeatureGroup {
+  key: string;
+  label: string;
+  features: FeatureItem[];
+}
+
+interface NewsItem {
+  headline: string;
+  source: string;
+  provider: string;
+  url?: string | null;
+  published_at?: string | null;
+}
+
+interface FeatureSnapshot {
+  as_of: string;
+  company_name?: string | null;
+  quote_currency?: string | null;
+  feature_count: number;
+  headlines_text?: string;
+  groups: FeatureGroup[];
+  news_items: NewsItem[];
+  provider_summary?: {
+    finnhub?: number;
+    yahoo?: number;
+    derived?: number;
+    fallback_fields?: number;
+  };
+}
+
+interface ModelFeatureImportance {
+  feature: string;
+  importance: number;
+}
+
+interface ModelQuality {
+  score_semantics?: string;
+  cv_accuracy_mean?: number | null;
+  cv_auc_mean?: number | null;
+  holdout_accuracy?: number | null;
+  holdout_auc?: number | null;
+  used_feature_count?: number;
+  zero_importance_feature_count?: number;
+  top_features?: ModelFeatureImportance[];
+}
+
+interface PredictionResult {
+  request_id: string;
+  ticker: string;
+  prediction: "Up" | "Down";
+  confidence: number;
+  prob_up: number;
+  as_of: string;
+  predicted_at: string;
+  model_artifact_uri?: string | null;
+  model_trained_at?: string | null;
+  model_quality?: ModelQuality | null;
+  feature_snapshot: FeatureSnapshot;
+}
+
+type SourceFilter = "all" | "finnhub" | "yahoo" | "derived";
+type SortMode = "group" | "value" | "source";
+
+interface FeatureRow extends FeatureItem {
+  groupKey: string;
+  groupLabel: string;
+}
+
+const compactFormatter = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+const percentFormatter = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 2,
+});
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  if (error && typeof error === "object") {
+    const record = error as Record<string, unknown>;
+
+    if (typeof record.message === "string" && record.message.trim()) {
+      return record.message;
+    }
+
+    if (typeof record.error === "string" && record.error.trim()) {
+      return record.error;
+    }
+  }
+
+  return "Prediction failed.";
+}
+
+function flattenFeatures(groups: FeatureGroup[]): FeatureRow[] {
+  return groups.flatMap((group) =>
+    group.features.map((feature) => ({
+      ...feature,
+      groupKey: group.key,
+      groupLabel: group.label,
+    })),
+  );
+}
+
+function getFeature(result: PredictionResult, name: string): FeatureRow | undefined {
+  return flattenFeatures(result.feature_snapshot.groups).find(
+    (feature) => feature.name === name,
+  );
+}
+
+function getNumericFeature(result: PredictionResult, name: string): number | null {
+  const value = getFeature(result, name)?.value;
+  return typeof value === "number" ? value : null;
+}
+
+function formatFeatureValue(feature: Pick<FeatureItem, "name" | "value">): string {
+  const value = feature.value;
+  if (value === null || value === undefined || value === "") {
+    return "n/a";
+  }
+
+  if (typeof value !== "number") {
+    return String(value);
+  }
+
+  if (
+    feature.name.includes("pct") ||
+    feature.name.includes("position") ||
+    feature.name.startsWith("tfidf_")
+  ) {
+    return `${percentFormatter.format(value * 100)}%`;
+  }
+
+  if (feature.name.includes("volume")) {
+    return compactFormatter.format(value);
+  }
+
+  if (feature.name.includes("sentiment")) {
+    return value.toFixed(4);
+  }
+
+  if (Number.isInteger(value)) {
+    return value.toLocaleString();
+  }
+
+  return value.toLocaleString(undefined, {
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatQuotedPrice(value: number | null, currency?: string | null): string {
+  if (value === null) {
+    return "n/a";
+  }
+
+  const normalizedCurrency = currency?.trim().toUpperCase();
+  if (normalizedCurrency) {
+    try {
+      return new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: normalizedCurrency,
+        currencyDisplay: "code",
+        maximumFractionDigits: 2,
+      }).format(value);
+    } catch {
+      return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${normalizedCurrency}`;
+    }
+  }
+
+  return `$${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+}
+
+function formatSignedPercent(value: number | null): string {
+  if (value === null) {
+    return "n/a";
+  }
+
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${percentFormatter.format(value * 100)}%`;
+}
+
+function formatClock(value?: string | null): string {
+  if (!value) {
+    return "n/a";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "n/a";
+  }
+
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatRelativeTime(value: string | null | undefined, nowMs: number): string {
+  if (!value) {
+    return "n/a";
+  }
+
+  const date = new Date(value);
+  const targetMs = date.getTime();
+  if (Number.isNaN(targetMs)) {
+    return "n/a";
+  }
+
+  const diffSeconds = Math.round((targetMs - nowMs) / 1000);
+  const absSeconds = Math.abs(diffSeconds);
+
+  const units = [
+    { limit: 60, seconds: 1, label: "s" },
+    { limit: 3600, seconds: 60, label: "m" },
+    { limit: 86400, seconds: 3600, label: "h" },
+    { limit: 604800, seconds: 86400, label: "d" },
+  ];
+
+  for (const unit of units) {
+    if (absSeconds < unit.limit) {
+      const amount = Math.max(1, Math.round(absSeconds / unit.seconds));
+      return diffSeconds >= 0 ? `in ${amount}${unit.label}` : `${amount}${unit.label} ago`;
+    }
+  }
+
+  const weeks = Math.max(1, Math.round(absSeconds / 604800));
+  return diffSeconds >= 0 ? `in ${weeks}w` : `${weeks}w ago`;
+}
+
+function getFeatureValueTone(feature: FeatureRow): string {
+  if (typeof feature.value !== "number") {
+    return "text-slate-950";
+  }
+
+  if (
+    feature.name.includes("pct") ||
+    feature.name.includes("change") ||
+    feature.name.includes("sentiment")
+  ) {
+    if (feature.value > 0) {
+      return "text-emerald-700";
+    }
+    if (feature.value < 0) {
+      return "text-rose-700";
+    }
+  }
+
+  return "text-slate-950";
+}
+
+function getSourceClasses(source: string): string {
+  if (source === "finnhub") {
+    return "bg-teal-100 text-teal-800";
+  }
+  if (source === "yahoo") {
+    return "bg-amber-100 text-amber-800";
+  }
+  if (source === "derived") {
+    return "bg-slate-200 text-slate-700";
+  }
+  return "bg-white/80 text-slate-600";
+}
+
+function getPredictionClasses(prediction: PredictionResult["prediction"]): string {
+  return prediction === "Up"
+    ? "from-emerald-500 to-teal-500 text-emerald-950"
+    : "from-orange-500 to-rose-500 text-rose-950";
+}
+
+function getPredictionAccent(prediction: PredictionResult["prediction"]): string {
+  return prediction === "Up" ? "text-emerald-700" : "text-rose-700";
+}
+
+function getDisplayCurrency(ticker: string, currency?: string | null): string | null {
+  const normalized = currency?.trim().toUpperCase();
+  if (normalized) {
+    return normalized;
+  }
+
+  if (/\.(TO|V|NE|CN)$/i.test(ticker)) {
+    return "CAD";
+  }
+
+  return "USD";
+}
+
+function getNewsTone(sentimentScore: number | null, headlineCount: number | null) {
+  if (headlineCount === null || headlineCount <= 0) {
+    return {
+      label: "No news",
+      summary: "No recent headlines were available for this snapshot.",
+      chipClasses: "border-slate-200 bg-slate-100 text-slate-700",
+      panelClasses: "border-slate-200/70 bg-white/85",
+      itemClasses: "border-slate-200/80 bg-white hover:border-slate-300 hover:bg-slate-50",
+    };
+  }
+
+  if (sentimentScore !== null && sentimentScore >= 0.05) {
+    return {
+      label: "News positive",
+      summary: "Headlines are leaning positive for this ticker right now.",
+      chipClasses: "border-emerald-200 bg-emerald-50 text-emerald-700",
+      panelClasses: "border-emerald-200/80 bg-emerald-50/70",
+      itemClasses: "border-emerald-100/90 bg-white hover:border-emerald-200 hover:bg-emerald-50/40",
+    };
+  }
+
+  if (sentimentScore !== null && sentimentScore <= -0.05) {
+    return {
+      label: "News negative",
+      summary: "Headlines are leaning negative for this ticker right now.",
+      chipClasses: "border-rose-200 bg-rose-50 text-rose-700",
+      panelClasses: "border-rose-200/80 bg-rose-50/70",
+      itemClasses: "border-rose-100/90 bg-white hover:border-rose-200 hover:bg-rose-50/40",
+    };
+  }
+
+  return {
+    label: "News mixed",
+    summary: "Headlines look mixed rather than clearly positive or negative.",
+    chipClasses: "border-amber-200 bg-amber-50 text-amber-800",
+    panelClasses: "border-amber-200/80 bg-amber-50/70",
+    itemClasses: "border-amber-100/90 bg-white hover:border-amber-200 hover:bg-amber-50/40",
+  };
+}
+
+function normalizeHeadline(headline: string): string {
+  return headline
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getDedupedNewsItems(items: NewsItem[]): NewsItem[] {
+  const sorted = [...items].sort((left, right) => {
+    const leftTime = left.published_at ? new Date(left.published_at).getTime() : 0;
+    const rightTime = right.published_at ? new Date(right.published_at).getTime() : 0;
+    return rightTime - leftTime;
+  });
+
+  const seen = new Set<string>();
+  const deduped: NewsItem[] = [];
+
+  for (const item of sorted) {
+    const key = normalizeHeadline(item.headline);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(item);
+  }
+
+  return deduped;
+}
+
+function MetricCard({
+  icon,
+  label,
+  value,
+  detail,
+  accent = "text-slate-950",
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  detail: string;
+  accent?: string;
+}) {
+  return (
+    <div className="rounded-[26px] border border-white/70 bg-white/80 p-4 shadow-[0_18px_60px_-42px_rgba(15,23,42,0.45)] backdrop-blur">
+      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">
+        {icon}
+        {label}
+      </div>
+      <div className={clsx("mt-3 text-2xl font-semibold tracking-tight", accent)}>{value}</div>
+      <p className="mt-2 text-sm leading-6 text-slate-600">{detail}</p>
+    </div>
+  );
+}
+
+function TopDriverCards({
+  driverFeatures,
+}: {
+  driverFeatures: FeatureRow[];
+}) {
+  if (driverFeatures.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="rounded-[32px] border border-white/70 bg-white/80 p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)] backdrop-blur">
+      <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+        <Brain className="h-4 w-4 text-slate-500" />
+        Top live drivers
+      </div>
+      <p className="mt-2 text-sm leading-6 text-slate-600">
+        These are the highest-importance features for the current model version, shown
+        with their live values for the requested ticker.
+      </p>
+      <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {driverFeatures.map((feature) => (
+          <div
+            key={feature.name}
+            className="rounded-[24px] border border-slate-200/70 bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(245,247,250,0.95))] p-4"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                  {feature.groupLabel}
+                </p>
+                <h3 className="mt-2 text-base font-semibold text-slate-950">
+                  {feature.label}
+                </h3>
+              </div>
+              <span
+                className={clsx(
+                  "rounded-full px-2.5 py-1 text-[11px] font-medium",
+                  getSourceClasses(feature.source),
+                )}
+              >
+                {feature.source}
+              </span>
+            </div>
+            <div className={clsx("mt-4 text-2xl font-semibold", getFeatureValueTone(feature))}>
+              {formatFeatureValue(feature)}
+            </div>
+            <p className="mt-2 text-xs text-slate-500">{feature.raw_fields.join(", ") || "n/a"}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FeatureWorkbench({
+  features,
+  search,
+  setSearch,
+  sourceFilter,
+  setSourceFilter,
+  sortMode,
+  setSortMode,
+  groupFilter,
+  setGroupFilter,
+  groups,
+}: {
+  features: FeatureRow[];
+  search: string;
+  setSearch: (value: string) => void;
+  sourceFilter: SourceFilter;
+  setSourceFilter: (value: SourceFilter) => void;
+  sortMode: SortMode;
+  setSortMode: (value: SortMode) => void;
+  groupFilter: string;
+  setGroupFilter: (value: string) => void;
+  groups: FeatureGroup[];
+}) {
+  return (
+    <div className="rounded-[32px] border border-white/70 bg-white/80 p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)] backdrop-blur">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+        <div>
+          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+            <Brain className="h-4 w-4 text-slate-500" />
+            All model inputs
+          </div>
+          <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
+            This is the full technical input frame. Headline vector dimensions such as
+            `tfidf_*` are internal numeric features, not human-readable explanations.
+          </p>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <label className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-500">
+            <Search className="h-4 w-4" />
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search features"
+              className="w-full bg-transparent text-slate-900 outline-none placeholder:text-slate-400"
+            />
+          </label>
+
+          <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2">
+            <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+              <Filter className="h-3.5 w-3.5" />
+              Source
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {(["all", "finnhub", "yahoo", "derived"] as const).map((option) => (
+                <button
+                  key={option}
+                  onClick={() => setSourceFilter(option)}
+                  className={clsx(
+                    "rounded-full px-2.5 py-1 text-xs font-medium transition",
+                    sourceFilter === option
+                      ? "bg-slate-900 text-white"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200",
+                  )}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2">
+            <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+              <BarChart3 className="h-3.5 w-3.5" />
+              Sort
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {(["group", "value", "source"] as const).map((option) => (
+                <button
+                  key={option}
+                  onClick={() => setSortMode(option)}
+                  className={clsx(
+                    "rounded-full px-2.5 py-1 text-xs font-medium capitalize transition",
+                    sortMode === option
+                      ? "bg-slate-900 text-white"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200",
+                  )}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-5 flex flex-wrap gap-2">
+        <button
+          onClick={() => setGroupFilter("all")}
+          className={clsx(
+            "rounded-full px-3 py-1.5 text-xs font-medium transition",
+            groupFilter === "all"
+              ? "bg-slate-900 text-white"
+              : "bg-slate-100 text-slate-600 hover:bg-slate-200",
+          )}
+        >
+          all groups
+        </button>
+        {groups.map((group) => (
+          <button
+            key={group.key}
+            onClick={() => setGroupFilter(group.key)}
+            className={clsx(
+              "rounded-full px-3 py-1.5 text-xs font-medium transition",
+              groupFilter === group.key
+                ? "bg-slate-900 text-white"
+                : "bg-slate-100 text-slate-600 hover:bg-slate-200",
+            )}
+          >
+            {group.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-5 grid gap-3 xl:grid-cols-2">
+        {features.map((feature) => (
+          <motion.div
+            key={`${feature.groupKey}-${feature.name}`}
+            layout
+            className="rounded-[24px] border border-slate-200/70 bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(245,247,250,0.95))] p-4"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500">
+                    {feature.groupLabel}
+                  </span>
+                  <span
+                    className={clsx(
+                      "rounded-full px-2.5 py-1 text-[11px] font-medium",
+                      getSourceClasses(feature.source),
+                    )}
+                  >
+                    {feature.source}
+                  </span>
+                  {feature.fallback_used && (
+                    <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-medium text-amber-800">
+                      fallback
+                    </span>
+                  )}
+                </div>
+                <h3 className="mt-3 text-base font-semibold text-slate-950">
+                  {feature.label}
+                </h3>
+              </div>
+              <div className={clsx("text-right text-xl font-semibold", getFeatureValueTone(feature))}>
+                {formatFeatureValue(feature)}
+              </div>
+            </div>
+
+            <div className="mt-4 space-y-2 text-xs text-slate-500">
+              <p>
+                <span className="font-semibold uppercase tracking-[0.16em] text-slate-400">
+                  providers
+                </span>{" "}
+                {feature.providers.join(" • ") || "n/a"}
+              </p>
+              <p>
+                <span className="font-semibold uppercase tracking-[0.16em] text-slate-400">
+                  raw fields
+                </span>{" "}
+                {feature.raw_fields.join(", ") || "n/a"}
+              </p>
+            </div>
+          </motion.div>
+        ))}
+      </div>
+
+      {features.length === 0 && (
+        <div className="mt-5 rounded-[24px] border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+          No features match the current search and filter combination.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NewsRail({
+  result,
+  nowMs,
+  tone,
+}: {
+  result: PredictionResult;
+  nowMs: number;
+  tone: ReturnType<typeof getNewsTone>;
+}) {
+  const items = getDedupedNewsItems(result.feature_snapshot.news_items).slice(0, 10);
+
+  return (
+    <div
+      className={clsx(
+        "flex h-[30rem] min-h-0 flex-col rounded-[28px] border p-5 shadow-[0_22px_70px_-44px_rgba(15,23,42,0.45)] backdrop-blur",
+        tone.panelClasses,
+      )}
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+          <Newspaper className="h-4 w-4 text-slate-500" />
+          Live news tone
+        </div>
+        <span
+          className={clsx(
+            "rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]",
+            tone.chipClasses,
+          )}
+        >
+          {tone.label}
+        </span>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <p className="text-sm leading-6 text-slate-700">{tone.summary}</p>
+        <span className="rounded-full bg-white/80 px-3 py-1 text-xs font-medium text-slate-600">
+          {items.length} shown / {result.feature_snapshot.news_items.length} raw
+        </span>
+      </div>
+
+      <p className="mt-2 text-sm leading-6 text-slate-600">
+        Duplicate headlines are collapsed here. The raw headline count is still preserved
+        for the model input.
+      </p>
+
+      <div className="mt-4 min-h-0 flex-1 overflow-hidden rounded-[24px] border border-white/60 bg-white/55 p-2">
+        <div className="h-full space-y-3 overflow-y-auto pr-1">
+          {items.map((item, index) => (
+            <a
+              key={`${item.headline}-${index}`}
+              href={item.url ?? undefined}
+              target={item.url ? "_blank" : undefined}
+              rel={item.url ? "noreferrer" : undefined}
+              className={clsx(
+                "block rounded-[22px] border px-4 py-3 transition",
+                tone.itemClasses,
+              )}
+            >
+              <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.18em] text-slate-400">
+                <span>{item.provider}</span>
+                {item.source ? <span>{item.source}</span> : null}
+                {item.published_at ? <span>{formatRelativeTime(item.published_at, nowMs)}</span> : null}
+              </div>
+              <p className="mt-2 text-sm leading-6 text-slate-800">{item.headline}</p>
+            </a>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function Home() {
+  const [ticker, setTicker] = useState("");
+  const [tickers, setTickers] = useState<string[]>([]);
+  const [results, setResults] = useState<PredictionResult[]>([]);
+  const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
+  const [sortMode, setSortMode] = useState<SortMode>("group");
+  const [groupFilter, setGroupFilter] = useState<string>("all");
+  const [showAllInputs, setShowAllInputs] = useState(false);
+  const [nowMs, setNowMs] = useState(Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 15000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (results.length === 0) {
+      setSelectedTicker(null);
+      return;
+    }
+
+    setSelectedTicker((current) => {
+      if (current && results.some((result) => result.ticker === current)) {
+        return current;
+      }
+      return results[0]?.ticker ?? null;
+    });
+  }, [results]);
+
+  const activeResult =
+    results.find((result) => result.ticker === selectedTicker) ?? results[0] ?? null;
+
+  const activeFeatures = activeResult
+    ? flattenFeatures(activeResult.feature_snapshot.groups)
+    : [];
+
+  const filteredFeatures = activeFeatures
+    .filter((feature) => {
+      if (sourceFilter !== "all" && feature.source !== sourceFilter) {
+        return false;
+      }
+
+      if (groupFilter !== "all" && feature.groupKey !== groupFilter) {
+        return false;
+      }
+
+      const query = search.trim().toLowerCase();
+      if (!query) {
+        return true;
+      }
+
+      return (
+        feature.label.toLowerCase().includes(query) ||
+        feature.name.toLowerCase().includes(query) ||
+        feature.groupLabel.toLowerCase().includes(query) ||
+        feature.raw_fields.some((field) => field.toLowerCase().includes(query))
+      );
+    })
+    .sort((left, right) => {
+      if (sortMode === "value") {
+        const leftValue = typeof left.value === "number" ? Math.abs(left.value) : -1;
+        const rightValue = typeof right.value === "number" ? Math.abs(right.value) : -1;
+        return rightValue - leftValue || left.label.localeCompare(right.label);
+      }
+
+      if (sortMode === "source") {
+        return (
+          left.source.localeCompare(right.source) ||
+          left.groupLabel.localeCompare(right.groupLabel) ||
+          left.label.localeCompare(right.label)
+        );
+      }
+
+      return (
+        left.groupLabel.localeCompare(right.groupLabel) ||
+        left.label.localeCompare(right.label)
+      );
+    });
+
+  const currentPrice = activeResult ? getNumericFeature(activeResult, "current_price") : null;
+  const dayChangePct = activeResult ? getNumericFeature(activeResult, "day_change_pct") : null;
+  const companyName = activeResult?.feature_snapshot.company_name?.trim() || null;
+  const quoteCurrency = activeResult
+    ? getDisplayCurrency(activeResult.ticker, activeResult.feature_snapshot.quote_currency)
+    : null;
+  const sentimentScore = activeResult ? getNumericFeature(activeResult, "sentiment_score") : null;
+  const headlineCount = activeResult ? getNumericFeature(activeResult, "headline_count") : null;
+  const vixLevel = activeResult ? getNumericFeature(activeResult, "vix_level") : null;
+  const spyChangePct = activeResult ? getNumericFeature(activeResult, "spy_change_pct") : null;
+  const avgNewsAgeHours = activeResult
+    ? getNumericFeature(activeResult, "avg_news_age_hours")
+    : null;
+  const volumeVsAvg10d = activeResult
+    ? getNumericFeature(activeResult, "volume_vs_avg_10d")
+    : null;
+  const priceVs50d = activeResult
+    ? getNumericFeature(activeResult, "price_vs_50d_avg")
+    : null;
+  const uniqueNewsCount = activeResult
+    ? getDedupedNewsItems(activeResult.feature_snapshot.news_items).length
+    : 0;
+  const topDriverFeatures = activeResult
+    ? (activeResult.model_quality?.top_features ?? [])
+        .map((row) => getFeature(activeResult, row.feature))
+        .filter((feature): feature is FeatureRow => Boolean(feature))
+    : [];
+  const newsTone = getNewsTone(sentimentScore, headlineCount);
+
+  function addTicker() {
+    const normalized = ticker.trim().toUpperCase();
+    if (!normalized || tickers.includes(normalized)) {
+      setTicker("");
+      return;
+    }
+
+    setTickers((prev) => [...prev, normalized]);
+    setSelectedTicker((current) => current ?? normalized);
+    setTicker("");
+  }
+
+  function removeTicker(target: string) {
+    setTickers((prev) => prev.filter((tickerItem) => tickerItem !== target));
+    setResults((prev) => prev.filter((result) => result.ticker !== target));
+    setSelectedTicker((current) => (current === target ? null : current));
+  }
+
+  async function predict() {
+    if (tickers.length === 0) {
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/predict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instances: tickers.map((tickerItem) => ({ ticker: tickerItem })),
+        }),
+      });
+
+      const data = (await res.json()) as {
+        predictions?: PredictionResult[];
+        error?: unknown;
+      };
+
+      if (!res.ok) {
+        throw new Error(getErrorMessage(data.error) || `HTTP ${res.status}`);
+      }
+
+      setResults(data.predictions ?? []);
+      setSearch("");
+      setSourceFilter("all");
+      setGroupFilter("all");
+      setSortMode("group");
+      setShowAllInputs(false);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,rgba(13,148,136,0.18),transparent_32%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.16),transparent_28%),linear-gradient(180deg,#f8f3e8_0%,#eff3ef_48%,#e9eff4_100%)] text-slate-950">
+      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+        <motion.div
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.45 }}
+        >
+          <div className="flex flex-wrap items-center gap-3 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">
+            <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
+              Finnhub primary
+            </span>
+            <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
+              Yahoo fallback
+            </span>
+            <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
+              BigQuery audit trail
+            </span>
+          </div>
+
+          <div className="mt-5 grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
+            <div className="rounded-[36px] border border-white/70 bg-white/75 p-6 shadow-[0_28px_90px_-52px_rgba(15,23,42,0.5)] backdrop-blur">
+              <div className="flex items-start justify-between gap-6">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">
+                    Live Prediction Desk
+                  </p>
+                  <h1 className="mt-3 max-w-3xl text-4xl font-semibold tracking-[-0.04em] text-slate-950 sm:text-5xl">
+                    Real-time ticker intelligence for live market snapshots.
+                  </h1>
+                  <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-600 sm:text-base">
+                    Queue one or more tickers, request a fresh snapshot, then inspect
+                    the prediction, market context, and the signals driving the readout.
+                  </p>
+                </div>
+                <div className="hidden rounded-[28px] border border-slate-200/80 bg-white/90 p-4 lg:block">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    <Database className="h-4 w-4 text-slate-500" />
+                    Stored
+                  </div>
+                  <div className="mt-3 text-3xl font-semibold tracking-tight text-slate-950">
+                    50
+                  </div>
+                  <p className="mt-2 max-w-[14rem] text-sm leading-6 text-slate-600">
+                    model features retained with snapshot timestamps
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-8 grid gap-4 xl:grid-cols-[1fr_auto_auto]">
+                <label className="rounded-[28px] border border-slate-200/80 bg-white px-4 py-4 shadow-inner shadow-slate-100">
+                  <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    Ticker
+                  </span>
+                  <div className="mt-2 flex items-center gap-3">
+                    <BarChart3 className="h-5 w-5 text-slate-400" />
+                    <input
+                      type="text"
+                      value={ticker}
+                      onChange={(event) => setTicker(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          addTicker();
+                        }
+                      }}
+                      placeholder="AAPL"
+                      className="w-full bg-transparent text-lg font-semibold uppercase tracking-[0.14em] text-slate-950 outline-none placeholder:text-slate-300"
+                    />
+                  </div>
+                </label>
+
+                <button
+                  onClick={addTicker}
+                  disabled={!ticker.trim()}
+                  className="inline-flex items-center justify-center gap-2 rounded-[28px] bg-slate-900 px-5 py-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Plus className="h-4 w-4" />
+                  Add
+                </button>
+
+                <button
+                  onClick={predict}
+                  disabled={tickers.length === 0 || loading}
+                  className="inline-flex items-center justify-center gap-2 rounded-[28px] bg-[linear-gradient(135deg,#0f766e,#0b3b5a)] px-5 py-4 text-sm font-semibold text-white transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {loading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Refreshing live frame
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-4 w-4" />
+                      {results.length > 0 ? "Refresh live signal" : "Run live prediction"}
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="mt-5 flex flex-wrap gap-2">
+                {tickers.length === 0 ? (
+                  <div className="rounded-full border border-dashed border-slate-300 px-3 py-1.5 text-sm text-slate-500">
+                    No tickers queued yet
+                  </div>
+                ) : (
+                  tickers.map((tickerItem) => (
+                    <button
+                      key={tickerItem}
+                      onClick={() => setSelectedTicker(tickerItem)}
+                      className={clsx(
+                        "inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm transition",
+                        tickerItem === selectedTicker
+                          ? "border-slate-900 bg-slate-900 text-white"
+                          : "border-slate-200 bg-white/80 text-slate-700 hover:bg-white",
+                      )}
+                    >
+                      {tickerItem}
+                      <span
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          removeTicker(tickerItem);
+                        }}
+                        className={clsx(
+                          "rounded-full p-0.5",
+                          tickerItem === selectedTicker ? "bg-white/15" : "bg-slate-100",
+                        )}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-[36px] border border-white/70 bg-[linear-gradient(150deg,rgba(255,255,255,0.92),rgba(255,255,255,0.72))] p-6 shadow-[0_28px_90px_-52px_rgba(15,23,42,0.5)] backdrop-blur">
+              {activeResult ? (
+                <>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                        Active ticker
+                      </p>
+                      <div className="mt-2 flex items-center gap-3">
+                        <div className="relative flex h-3 w-3">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+                          <span className="relative inline-flex h-3 w-3 rounded-full bg-emerald-500" />
+                        </div>
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-slate-600">
+                              {activeResult.ticker}
+                            </span>
+                            {quoteCurrency && (
+                              <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700">
+                                {quoteCurrency}
+                              </span>
+                            )}
+                          </div>
+                          <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-950">
+                            {companyName ?? activeResult.ticker}
+                          </h2>
+                          {companyName && (
+                            <p className="mt-1 text-sm text-slate-500">
+                              Full company name for {activeResult.ticker}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <div
+                        className={clsx(
+                          "rounded-full bg-gradient-to-r px-4 py-2 text-sm font-semibold",
+                          getPredictionClasses(activeResult.prediction),
+                        )}
+                      >
+                        {activeResult.prediction}
+                      </div>
+                      <div
+                        className={clsx(
+                          "rounded-full border px-4 py-2 text-sm font-semibold",
+                          newsTone.chipClasses,
+                        )}
+                      >
+                        {newsTone.label}
+                      </div>
+                    </div>
+                  </div>
+
+                    <div className="mt-6 rounded-[30px] border border-slate-200/80 bg-slate-950 p-5 text-white">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-white/60">
+                          <Gauge className="h-4 w-4" />
+                        Up probability
+                        </div>
+                        <span className="text-sm text-white/70">
+                        {activeResult.prediction === "Up" ? "above 50% = Up" : "below 50% = Down"}
+                        </span>
+                      </div>
+                    <div className="mt-5">
+                      <div className="flex items-end justify-between">
+                        <div className="text-5xl font-semibold tracking-tight">
+                          {(activeResult.prob_up * 100).toFixed(1)}%
+                        </div>
+                        <div className={clsx("text-base font-semibold", getPredictionAccent(activeResult.prediction))}>
+                          {activeResult.prediction === "Up" ? (
+                            <span className="inline-flex items-center gap-2">
+                              <TrendingUp className="h-4 w-4" />
+                              predicted up
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-2">
+                              <TrendingDown className="h-4 w-4" />
+                              predicted down
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <p className="mt-3 text-sm leading-6 text-white/70">
+                        This shows how likely the model thinks this ticker will move up. It is
+                        a probability score, not the model&apos;s historical accuracy.
+                      </p>
+                      <div className="mt-5 h-3 overflow-hidden rounded-full bg-white/10">
+                        <div
+                          className={clsx(
+                            "h-full rounded-full bg-gradient-to-r",
+                            activeResult.prediction === "Up"
+                              ? "from-emerald-400 to-cyan-300"
+                              : "from-orange-400 to-rose-400",
+                          )}
+                          style={{ width: `${Math.max(8, activeResult.prob_up * 100)}%` }}
+                        />
+                      </div>
+                      <div className="mt-2 flex items-center justify-between text-xs uppercase tracking-[0.18em] text-white/50">
+                        <span>Down</span>
+                        <span>Balanced</span>
+                        <span>Up</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-[24px] border border-slate-200/70 bg-white/90 p-4">
+                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                        <Clock3 className="h-4 w-4 text-slate-500" />
+                        Freshness
+                      </div>
+                      <p className="mt-3 text-lg font-semibold text-slate-950">
+                        snapshot {formatRelativeTime(activeResult.as_of, nowMs)}
+                      </p>
+                      <p className="mt-1 text-sm text-slate-600">
+                        {formatClock(activeResult.as_of)}
+                      </p>
+                    </div>
+
+                    <div className="rounded-[24px] border border-slate-200/70 bg-white/90 p-4">
+                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                        <Activity className="h-4 w-4 text-slate-500" />
+                        Prediction event
+                      </div>
+                      <p className="mt-3 text-lg font-semibold text-slate-950">
+                        scored {formatRelativeTime(activeResult.predicted_at, nowMs)}
+                      </p>
+                      <p className="mt-1 text-sm text-slate-600">
+                        request {activeResult.request_id}
+                      </p>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="flex h-full min-h-[22rem] flex-col justify-between">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                      Waiting for a live request
+                    </p>
+                    <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-950">
+                      The right panel turns into a live signal board once a ticker is scored.
+                    </h2>
+                    <p className="mt-4 text-sm leading-7 text-slate-600">
+                      You will see prediction strength, snapshot age, provider mix, model
+                      lineage, the news set used for inference, and a searchable feature grid.
+                    </p>
+                  </div>
+
+                  <div className="mt-8 grid gap-3 sm:grid-cols-2">
+                    <MetricCard
+                      icon={<Gauge className="h-4 w-4 text-slate-500" />}
+                      label="Signal board"
+                      value="Live"
+                      detail="Request-time snapshot rendered beside the input queue."
+                    />
+                    <MetricCard
+                      icon={<Brain className="h-4 w-4 text-slate-500" />}
+                      label="Transparency"
+                      value="50 features"
+                      detail="Grouped and searchable with raw source field references."
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {error && (
+            <div className="mt-6 flex items-start gap-3 rounded-[26px] border border-rose-200 bg-rose-50/95 px-4 py-3 text-sm text-rose-700 shadow-sm">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          {results.length > 0 && activeResult && (
+            <div className="mt-6">
+              <div className="flex flex-wrap gap-2">
+                {results.map((result) => (
+                  <button
+                    key={result.request_id}
+                    onClick={() => setSelectedTicker(result.ticker)}
+                    className={clsx(
+                      "rounded-full border px-4 py-2 text-sm transition",
+                      result.ticker === activeResult.ticker
+                        ? "border-slate-900 bg-slate-900 text-white"
+                        : "border-white/70 bg-white/80 text-slate-700 hover:bg-white",
+                    )}
+                  >
+                    <span className="font-semibold">{result.ticker}</span>
+                    <span className="ml-2 text-xs uppercase tracking-[0.16em] opacity-70">
+                      {result.prediction}
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+              <AnimatePresence mode="wait">
+                <motion.div
+                  key={activeResult.request_id}
+                  initial={{ opacity: 0, y: 18 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -18 }}
+                  transition={{ duration: 0.28 }}
+                  className="mt-6 grid gap-6 xl:grid-cols-[1.2fr_0.8fr]"
+                >
+                  <div className="space-y-6">
+                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                      <MetricCard
+                        icon={<BarChart3 className="h-4 w-4 text-slate-500" />}
+                        label={quoteCurrency ? `Live price ${quoteCurrency}` : "Live price"}
+                        value={formatQuotedPrice(currentPrice, quoteCurrency)}
+                        detail={
+                          quoteCurrency
+                            ? `Currency ${quoteCurrency}. Day move ${formatSignedPercent(dayChangePct)}`
+                            : `Day move ${formatSignedPercent(dayChangePct)}`
+                        }
+                        accent={
+                          dayChangePct !== null
+                            ? dayChangePct >= 0
+                              ? "text-emerald-700"
+                              : "text-rose-700"
+                            : "text-slate-950"
+                        }
+                      />
+                      <MetricCard
+                        icon={
+                          spyChangePct !== null && spyChangePct >= 0 ? (
+                            <ArrowUpRight className="h-4 w-4 text-emerald-600" />
+                          ) : (
+                            <ArrowDownRight className="h-4 w-4 text-rose-600" />
+                          )
+                        }
+                        label="Market context"
+                        value={formatSignedPercent(spyChangePct)}
+                        detail={
+                          vixLevel !== null
+                            ? `VIX ${formatFeatureValue({ name: "vix_level", value: vixLevel })}`
+                            : "VIX n/a"
+                        }
+                        accent={
+                          spyChangePct !== null && spyChangePct >= 0
+                            ? "text-emerald-700"
+                            : "text-rose-700"
+                        }
+                      />
+                      <MetricCard
+                        icon={<BarChart3 className="h-4 w-4 text-slate-500" />}
+                        label="Volume vs 10D"
+                        value={
+                          volumeVsAvg10d !== null
+                            ? formatFeatureValue({ name: "volume_vs_avg_10d", value: volumeVsAvg10d })
+                            : "n/a"
+                        }
+                        detail={
+                          priceVs50d !== null
+                            ? `Price vs 50D ${formatSignedPercent(priceVs50d)}`
+                            : "50D comparison unavailable"
+                        }
+                        accent={
+                          volumeVsAvg10d !== null && volumeVsAvg10d >= 1
+                            ? "text-emerald-700"
+                            : "text-slate-950"
+                        }
+                      />
+                      <MetricCard
+                        icon={<Clock3 className="h-4 w-4 text-slate-500" />}
+                        label="News input"
+                        value={
+                          headlineCount !== null
+                            ? `${headlineCount.toLocaleString()} raw`
+                            : "n/a"
+                        }
+                        detail={
+                          avgNewsAgeHours !== null
+                            ? `${uniqueNewsCount} unique shown, avg age ${avgNewsAgeHours.toFixed(1)}h`
+                            : `${uniqueNewsCount} unique shown`
+                        }
+                      />
+                    </div>
+
+                    <TopDriverCards driverFeatures={topDriverFeatures} />
+
+                    <NewsRail result={activeResult} nowMs={nowMs} tone={newsTone} />
+
+                    <div className="rounded-[32px] border border-white/70 bg-white/80 p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)] backdrop-blur">
+                      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                        <div>
+                          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                            <Database className="h-4 w-4 text-slate-500" />
+                            Technical input frame
+                          </div>
+                          <p className="mt-2 text-sm leading-6 text-slate-600">
+                            Expand this only when you want the raw 50-field model input. The
+                            `tfidf_*` headline-vector fields are internal dimensions, not natural-language explanations.
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => setShowAllInputs((current) => !current)}
+                          className="rounded-full bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+                        >
+                          {showAllInputs ? "Hide raw inputs" : "Show all 50 inputs"}
+                        </button>
+                      </div>
+                    </div>
+
+                    {showAllInputs && (
+                      <FeatureWorkbench
+                        features={filteredFeatures}
+                        search={search}
+                        setSearch={setSearch}
+                        sourceFilter={sourceFilter}
+                        setSourceFilter={setSourceFilter}
+                        sortMode={sortMode}
+                        setSortMode={setSortMode}
+                        groupFilter={groupFilter}
+                        setGroupFilter={setGroupFilter}
+                        groups={activeResult.feature_snapshot.groups}
+                      />
+                    )}
+                  </div>
+
+                  <div className="space-y-6 xl:sticky xl:top-6 xl:self-start">
+                    <div className="rounded-[28px] border border-slate-200/70 bg-white/85 p-5 shadow-[0_22px_70px_-44px_rgba(15,23,42,0.45)] backdrop-blur">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                        <Gauge className="h-4 w-4 text-slate-500" />
+                        Technical model report
+                      </div>
+                      <p className="mt-3 text-sm leading-6 text-slate-600">
+                        Reliability metrics, fold breakdown, and learned feature ranking are now
+                        on a separate technical page sourced from BigQuery `model_metadata`.
+                      </p>
+                      <Link
+                        href="/model-reliability"
+                        className="mt-4 inline-flex items-center gap-2 rounded-full bg-[linear-gradient(135deg,#155e75,#1d4ed8)] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-105"
+                      >
+                        Open technical report
+                        <ArrowUpRight className="h-4 w-4" />
+                      </Link>
+                    </div>
+
+                    <div className="rounded-[28px] border border-slate-200/70 bg-white/85 p-5 shadow-[0_22px_70px_-44px_rgba(15,23,42,0.45)] backdrop-blur">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                        <Sparkles className="h-4 w-4 text-slate-500" />
+                        Model frame
+                      </div>
+                      <div className="mt-4 grid gap-3">
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            feature volume
+                          </p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">
+                            {activeResult.feature_snapshot.feature_count}
+                          </p>
+                        </div>
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            non-zero importance features
+                          </p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">
+                            {activeResult.model_quality?.used_feature_count ?? "n/a"}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {activeResult.model_quality?.zero_importance_feature_count ?? "n/a"} zero-importance inputs in this model
+                          </p>
+                        </div>
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            audit target
+                          </p>
+                          <p className="mt-2 text-sm font-semibold text-slate-950">
+                            BigQuery live_feature_snapshots
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            request_id {activeResult.request_id}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-[28px] border border-slate-200/70 bg-white/85 p-5 shadow-[0_22px_70px_-44px_rgba(15,23,42,0.45)] backdrop-blur">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                        <Activity className="h-4 w-4 text-slate-500" />
+                        Request telemetry
+                      </div>
+                      <div className="mt-4 space-y-4">
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            Snapshot timestamp
+                          </p>
+                          <p className="mt-2 text-sm font-semibold text-slate-950">
+                            {formatClock(activeResult.as_of)}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {formatRelativeTime(activeResult.as_of, nowMs)}
+                          </p>
+                        </div>
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            Prediction timestamp
+                          </p>
+                          <p className="mt-2 text-sm font-semibold text-slate-950">
+                            {formatClock(activeResult.predicted_at)}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {formatRelativeTime(activeResult.predicted_at, nowMs)}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                  </div>
+                </motion.div>
+              </AnimatePresence>
+            </div>
+          )}
+        </motion.div>
+      </div>
+    </div>
+  );
+}

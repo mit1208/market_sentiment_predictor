@@ -1,0 +1,8 @@
+google-cloud-bigquery
+google-cloud-run
+pandas
+requests>=2.31.0
+yfinance
+pyarrow
+pandas-gbq
+PyYAML

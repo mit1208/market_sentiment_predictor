@@ -1,0 +1,15 @@
+pandas
+numpy
+scikit-learn
+lightgbm
+joblib
+google-cloud-bigquery[pandas]
+google-cloud-storage
+google-cloud-aiplatform
+requests>=2.31.0
+yfinance
+newsapi-python
+pyarrow
+db-dtypes
+python-dotenv
+vaderSentiment>=3.3.2
