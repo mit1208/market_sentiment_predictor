@@ -1,43 +1,42 @@
-This frontend calls the server-side `/api/predict` route, which proxies to the deployed prediction API.
+# Frontend
 
-Set `PREDICT_API_URL` in `frontend/.env.local` to the Cloud Run prediction service URL:
+This app calls the server-side `/api/predict` route, which proxies requests to the deployed backend
+prediction API.
+
+## Environment
+
+Copy `frontend/.env.local.example` to `frontend/.env.local` and set `PREDICT_API_URL` to the
+backend prediction URL.
+
+From the repo root, you can fetch the deployed Cloud Run service URL from Terraform:
 
 ```bash
-cd ../terraform
+cd infra/terraform
 terraform output -raw prediction_service_url
 ```
 
-## Getting Started
-
-First, run the development server:
+Then set:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+PREDICT_API_URL=https://...a.run.app/predict
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Do not commit `frontend/.env.local`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Local Development
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+From `frontend/`:
 
-## Learn More
+```bash
+npm install
+npm run dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+Open `http://localhost:3000`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Monorepo Context
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `frontend/src/app/` contains the UI routes.
+- `frontend/src/app/api/predict/route.ts` is the proxy to the backend API.
+- Backend services live under `../backend/`.
+- Infrastructure lives under `../infra/terraform/`.

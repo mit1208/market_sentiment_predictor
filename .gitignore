@@ -114,6 +114,10 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
+.envrc
+.direnv/
 
 # mypy
 .mypy_cache/
@@ -165,6 +169,22 @@ data/
 !*config*.json
 !*schema*.json
 !model_metadata.json
+!infra/terraform/*.json
+infra/terraform/function_source.zip
+*.pem
+*.key
+*.p12
+*.crt
+*.cer
+*.mobileprovision
+*.secrets.*
+secrets/
+credentials/
+*credentials*.json
+*service-account*.json
+*.tfvars
+*.tfvars.json
+!infra/terraform/terraform.tfvars.example
 
 # Terraform
 **/.terraform/*
@@ -172,8 +192,6 @@ data/
 *.tfstate.*
 crash.log
 crash.*.log
-*.tfvars
-*.tfvars.json
 override.tf
 override.tf.json
 *_override.tf

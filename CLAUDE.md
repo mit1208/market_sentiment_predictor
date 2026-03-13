@@ -4,7 +4,9 @@ This file provides guidance to AI agents (Codex, Claude Code, etc.) when working
 
 ## Project Overview
 
-End-to-end ML pipeline: ingest financial news + stock data into BigQuery → Vertex AI Pipeline trains LightGBM (TF-IDF for sentiment) → Evaluate → Conditionally Deploy to Vertex AI endpoint → advisor-facing Next.js frontend on Vercel lets users enter tickers + today's headlines and see tomorrow's predicted Up/Down price direction.
+End-to-end market sentiment system: ingest market/news data into BigQuery, train and evaluate a
+LightGBM model, serve live predictions from Cloud Run, and expose the results through a Next.js
+frontend.
 
 ## Current Baseline Metrics
 
@@ -22,123 +24,109 @@ Latest promoted baseline from BigQuery `model_metadata` (`2026-03-13 20:27:24 UT
 
 ## Repository Layout
 
-```
+```text
 market_sentiment_predictor/
-├── cloud_function/       # GCP Cloud Function v2 — weekly ingestion + trigger Vertex AI Pipeline
-├── pipeline/             # Vertex AI Pipelines (KFP) code
-│   ├── components/       # KFP components: train, evaluate, deploy
-│   ├── pipeline.py       # KFP pipeline definition (DAG)
-│   ├── Dockerfile        # Base image for all pipeline components
-│   └── requirements.txt
-├── endpoint/             # Vertex AI custom serving container — FastAPI, loads model from GCS
-│   ├── main.py           # POST /predict  GET /health
-│   ├── predictor.py      # Loads model + TF-IDF, predicts (inlined features)
-│   ├── Dockerfile        # Build from project root: docker build -f endpoint/Dockerfile .
-│   └── requirements.txt
-├── frontend/             # Next.js 16 app (Vercel) — advisor UI: add tickers + headlines → predict
-│   └── src/app/page.tsx  # Single page, calls Vertex AI endpoint directly
-├── terraform/            # All GCP infrastructure as code
-│   ├── main.tf           # BigQuery, GCS, Artifact Registry, Cloud Function, Vertex AI Endpoint, IAM
-│   ├── variables.tf
-│   ├── outputs.tf
-│   └── *.json            # BigQuery table schemas
-└── requirements.txt      # Local dev dependencies (includes kfp)
+├── backend/
+│   ├── api/              # Cloud Run FastAPI service
+│   ├── ingestion/        # Cloud Function source
+│   ├── ml/
+│   │   ├── training/     # Training job orchestration + feature snapshot build
+│   │   ├── inference/    # Online predictor + batch inference job
+│   │   ├── testing/      # ML-focused tests
+│   │   └── shared/       # Shared feature engineering and live data helpers
+│   ├── db/               # dbmate schema + migrations
+│   └── tests/            # Backend service and ingestion tests
+├── frontend/             # Next.js app
+├── infra/
+│   └── terraform/        # GCP infrastructure as code
+├── docs/
+└── requirements.txt      # Local dev/test Python dependencies
 ```
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  GCP (project: llm-testing-489113, region: us-central1)             │
-│                                                                     │
-│  Cloud Scheduler (Sunday 00:00)                                     │
-│    └─► Cloud Function v2 (market-data-ingestion)                   │
-│          ├─ yfinance + NewsAPI → BigQuery                           │
-│          └─ Submit Vertex AI PipelineJob                            │
-│                                                                     │
-│  Vertex AI Pipeline (market-sentiment-pipeline)                     │
-│    ├─ Step 1: Train (BQ → technical features + TF-IDF → LightGBM)   │
-│    ├─ Step 2: Evaluate (Accuracy > 0.50 check)                      │
-│    └─ Step 3: Deploy (Conditional: Upload to Model Registry +       │
-│                        Update Vertex AI Endpoint)                   │
-│                                                                     │
-│  Vertex AI Endpoint (market-sentiment-predictor)                    │
-│    POST /predict  ← called directly by Vercel frontend              │
-│    (FastAPI + TF-IDF vectorizer + LightGBM)                        │
-└─────────────────────────────────────────────────────────────────────┘
+```text
+Cloud Scheduler
+  -> Cloud Function (`backend/ingestion`)
+  -> Cloud Run Job (`backend.ml.training.job_runner`)
 
-Vercel (frontend/)
-  Advisor enters tickers + today's headlines
-    └─► POST to Vertex AI endpoint → Up/Down + confidence
+Cloud Run Job (`backend.ml.training.job_runner`)
+  -> rebuild historical feature snapshots
+  -> train LightGBM + TF-IDF
+  -> evaluate with time-based CV + holdout
+  -> promote latest manifest in GCS
+
+Cloud Run Job (`backend.ml.inference.batch_job`)
+  -> score queued batch requests with live features
+
+Cloud Run Service (`backend.api.main`)
+  -> fetch live market/news features
+  -> load promoted model from GCS
+  -> return prediction + feature snapshot
+
+Next.js frontend
+  -> calls frontend API route
+  -> proxies to backend prediction service
 ```
 
 ## Key Technology Choices
 
 | Concern | Choice | Reason |
 |---------|--------|--------|
-| Workflow | Vertex AI Pipelines (KFP) | Managed orchestration, artifact lineage, reproducibility |
+| Workflow | Cloud Function + Cloud Run Jobs | Simple event-driven orchestration for ingest/train/batch inference |
 | Text Sentiment | TF-IDF (Scikit-learn) | Faster, lower cost, no external API calls at inference |
 | ML model | LightGBM + TimeSeriesSplit CV | Fast, handles tabular data, respects time ordering |
-| Serving | Custom FastAPI container on Vertex AI | Needs live BQ history + TF-IDF vectorization |
+| Serving | FastAPI on Cloud Run | Pulls promoted artifacts from GCS and computes live features |
 | Infra | Terraform | Reproducible, all resources in one place |
-| Frontend | Next.js on Vercel | GitHub-linked auto-deploy; calls Vertex AI endpoint directly |
+| Frontend | Next.js | Simple UI and server-side proxy for prediction requests |
 
-## Dockerfiles — always build from project root
+## Dockerfiles
+
+Build from the project root:
 
 ```bash
-# Endpoint (serving)
-docker build -f endpoint/Dockerfile -t <REGION>-docker.pkg.dev/<PROJECT>/market-sentiment/endpoint:latest .
-
-# Pipeline components (all steps)
-docker build -f pipeline/Dockerfile -t <REGION>-docker.pkg.dev/<PROJECT>/market-sentiment/pipeline:latest .
+docker build -f backend/api/Dockerfile -t <REGION>-docker.pkg.dev/<PROJECT>/market-sentiment/endpoint:latest .
+docker build -f backend/ml/Dockerfile -t <REGION>-docker.pkg.dev/<PROJECT>/market-sentiment/pipeline:latest .
 ```
 
 ## Environment Variables
 
-### Cloud Function (`cloud_function/`)
-| Variable | Description |
-|----------|-------------|
-| `GCP_PROJECT_ID` | GCP project ID |
-| `GCP_REGION` | GCP region |
-| `BQ_DATASET_ID` | BigQuery dataset |
-| `NEWSAPI_KEY` | NewsAPI key |
-| `GCS_BUCKET` | Bucket for model artifacts |
-| `PIPELINE_TEMPLATE_URI` | GCS path to compiled `pipeline.json` |
-| `VERTEX_ENDPOINT_ID` | Vertex AI endpoint resource name |
-| `SERVING_CONTAINER_IMAGE_URI` | Endpoint image URI |
+### Ingestion Function (`backend/ingestion/`)
 
-### Pipeline Components
-Stored in `pipeline/components/` and configured in `pipeline.py`:
-| Variable | Description |
-|----------|-------------|
-| `GCP_PROJECT_ID` | GCP project ID |
-| `GCP_REGION` | GCP region |
-| `GCS_BUCKET` | GCS bucket for model artifacts |
-| `BQ_DATASET` | BigQuery dataset |
-| `VERTEX_ENDPOINT_ID` | Vertex AI endpoint resource name |
-| `SERVING_CONTAINER_IMAGE_URI` | Endpoint container image URI |
+- `GCP_PROJECT_ID`
+- `GCP_REGION`
+- `BQ_DATASET_ID`
+- `TRAINING_JOB_NAME`
+- `FINNHUB_KEY`
 
-### Endpoint / Serving (`endpoint/predictor.py`)
-Set automatically by Vertex AI at container startup:
-| Variable | Description |
-|----------|-------------|
-| `AIP_STORAGE_URI` | GCS path to model artifacts (`model.joblib`, `tfidf_vectorizer.joblib`, `metadata.json`) |
-| `GCP_PROJECT_ID` | GCP project ID |
-| `GCP_REGION` | GCP region |
-| `BQ_DATASET` | BigQuery dataset |
+### ML Jobs (`backend/ml/`)
 
-### Frontend — Vercel environment variables
-| Variable | Description |
-|----------|-------------|
-| `NEXT_PUBLIC_VERTEX_ENDPOINT_URL` | Vertex AI prediction URL (from `terraform output vertex_endpoint_name`) |
+- `GCP_PROJECT_ID`
+- `GCP_REGION`
+- `BQ_DATASET`
+- `GCS_BUCKET`
+- `MODEL_MANIFEST_URI`
+- `FINNHUB_KEY`
+
+### API Service (`backend/api/`)
+
+- `GCP_PROJECT_ID`
+- `GCP_REGION`
+- `BQ_DATASET`
+- `MODEL_MANIFEST_URI`
+- `FINNHUB_KEY`
+
+### Frontend
+
+- `PREDICT_API_URL`
 
 ## Terraform
 
 ```bash
-cd terraform
+cd infra/terraform
 terraform init
-terraform plan  -var="newsapi_key=<KEY>"
-terraform apply -var="newsapi_key=<KEY>"
+terraform plan
+terraform apply
 ```
 
 ## BigQuery Schema (dataset: `market_sentiment_predictor`)
@@ -147,22 +135,19 @@ terraform apply -var="newsapi_key=<KEY>"
 |-------|---------|
 | `raw_market_data` | Daily OHLCV per ticker, partitioned by `date` |
 | `raw_news_data` | News headlines per ticker, partitioned by `date` |
-| `model_metadata` | Pipeline run results |
+| `training_feature_snapshots` | Historical live-feature-compatible training rows |
+| `live_feature_snapshots` | Endpoint and batch inference audit rows |
+| `model_metadata` | Training/evaluation metadata |
 
 ## Shared Logic
 
-Technical feature engineering (RSI, MACD, etc.) is **inlined** in both `pipeline/components/train.py` and `endpoint/predictor.py` to simplify deployment and ensure training/serving consistency without complicated shared-file Docker copies.
+Feature engineering, live snapshot construction, and snapshot persistence live in
+`backend/ml/shared/` and are reused by training, batch inference, and the FastAPI service.
 
 ## Coding Conventions
 
 - Python services: `GCP_PROJECT_ID`, `GCP_REGION` env vars with sensible defaults
-- All Dockerfiles build from **project root** (not from their own directory)
-- Terraform resource names follow pattern: `google_<resource_type>.<short_name>`
-- BigQuery MERGE pattern in Cloud Function prevents duplicate rows on re-runs
-- Vertex AI Pipeline compiles to `pipeline.json` for submission
-
-## Deliverables Checklist
-
-- [x] Modular, clean GitHub repository
-- [x] Architecture Diagram
-- [x] Performance Report populated with the 2026-03-13 promoted baseline metrics
+- All Dockerfiles build from the project root
+- Terraform resource names follow `google_<resource_type>.<short_name>`
+- BigQuery MERGE in ingestion prevents duplicate rows on re-runs
+- Backend tests run from the project root with `make test`

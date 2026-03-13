@@ -62,9 +62,16 @@ Frontend local config should include:
 PREDICT_API_URL=https://...a.run.app/predict
 ```
 
+Use `.env.example`, `frontend/.env.local.example`, and
+`infra/terraform/terraform.tfvars.example` as templates. Do not commit real credentials, `.env`
+files, `*.tfvars`, service-account JSON, or certificate/key material.
+
 ## Deployment
 
 Use the `Makefile` from the project root.
+
+Infrastructure code now lives under `infra/terraform`, while runtime code is split into
+`frontend/` and `backend/`.
 
 Initial schema update:
 
@@ -109,6 +116,26 @@ make rollout
 ```
 
 The deployment targets read `FINNHUB_KEY` from `.env` and push it into the Cloud Run job/service environment.
+
+## Local Backend
+
+Run the backend smoke tests from the project root:
+
+```bash
+make test
+```
+
+Run a tracked-file secret scan before pushing a public branch:
+
+```bash
+make scan-secrets
+```
+
+Run the full backend plus ML suite in an environment with the ML dependencies installed:
+
+```bash
+make test-all
+```
 
 ## Local Frontend
 
@@ -158,15 +185,22 @@ Top baseline drivers are still price/volume features such as `day_range_position
 sentiment, and TF-IDF headline features all carried zero importance. The full recorded report is
 in `docs/superpowers/performance-report.md`.
 
-## Project Structure
+## Monorepo Layout
 
 ```text
-├── market_data_ingestion/   # historical raw market/news ingestion
-├── pipeline/                # training job + batch inference job
-├── endpoint/                # Cloud Run FastAPI service
+├── backend/
+│   ├── api/                 # FastAPI prediction service + container
+│   ├── ingestion/           # Cloud Function source for raw market/news ingestion
+│   ├── ml/
+│   │   ├── training/        # model training orchestration + feature snapshot backfill
+│   │   ├── inference/       # online predictor + batch inference job
+│   │   ├── testing/         # ML contract and feature engineering tests
+│   │   └── shared/          # shared feature contract + live data helpers
+│   ├── db/                  # schema dump + dbmate migrations
+│   └── tests/               # backend service and ingestion tests
 ├── frontend/                # Next.js UI
-├── shared/                  # shared feature contract + live fetch helpers
-├── db/                      # schema dump + dbmate migrations
-├── terraform/               # infrastructure definitions
+├── infra/
+│   └── terraform/           # infrastructure definitions
+├── docs/                    # architecture notes, specs, reports
 └── Makefile
 ```
