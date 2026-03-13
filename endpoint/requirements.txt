@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+joblib
+numpy
+pandas
+scikit-learn
+google-cloud-bigquery[pandas]
+google-cloud-storage
+db-dtypes
+pyarrow
+requests>=2.31.0
+yfinance
+lightgbm
+vaderSentiment>=3.3.2

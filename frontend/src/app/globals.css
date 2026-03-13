@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8f3e8;
+  --foreground: #0f172a;
+  --surface: rgba(255, 255, 255, 0.72);
+  --line: rgba(15, 23, 42, 0.08);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+  text-rendering: optimizeLegibility;
+}
+
+body::selection {
+  background: rgba(13, 148, 136, 0.22);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}

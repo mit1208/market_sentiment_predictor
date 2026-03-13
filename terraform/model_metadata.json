@@ -1,0 +1,89 @@
+[
+  {
+    "mode": "REQUIRED",
+    "name": "model_id",
+    "type": "STRING"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "version",
+    "type": "STRING"
+  },
+  {
+    "mode": "REQUIRED",
+    "name": "training_date",
+    "type": "TIMESTAMP"
+  },
+  {
+    "name": "training_start_date",
+    "type": "DATE"
+  },
+  {
+    "name": "training_end_date",
+    "type": "DATE"
+  },
+  {
+    "mode": "REPEATED",
+    "name": "feature_list",
+    "type": "STRING"
+  },
+  {
+    "name": "feature_count",
+    "type": "INTEGER"
+  },
+  {
+    "name": "model_type",
+    "type": "STRING"
+  },
+  {
+    "name": "training_samples",
+    "type": "INTEGER"
+  },
+  {
+    "name": "hyperparameters",
+    "type": "JSON"
+  },
+  {
+    "name": "performance_metrics",
+    "type": "JSON"
+  },
+  {
+    "name": "validation_metrics",
+    "type": "JSON"
+  },
+  {
+    "name": "test_metrics",
+    "type": "JSON"
+  },
+  {
+    "name": "class_weights",
+    "type": "JSON"
+  },
+  {
+    "fields": [
+      {
+        "name": "feature",
+        "type": "STRING"
+      },
+      {
+        "name": "importance",
+        "type": "FLOAT"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "feature_importance",
+    "type": "RECORD"
+  },
+  {
+    "name": "data_lineage",
+    "type": "JSON"
+  },
+  {
+    "name": "notes",
+    "type": "STRING"
+  },
+  {
+    "name": "created_by",
+    "type": "STRING"
+  }
+]
