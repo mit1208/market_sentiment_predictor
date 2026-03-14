@@ -122,6 +122,34 @@ def _training_snapshot_table() -> str:
     )
 
 
+def _training_ticker_table() -> str:
+    return qualify_table_name(
+        "training_tickers",
+        project_id=PROJECT_ID or None,
+        dataset_id=DATASET_ID or None,
+    )
+
+
+def _resolve_bootstrap_tickers() -> list[str]:
+    if BOOTSTRAP_TICKERS:
+        return BOOTSTRAP_TICKERS
+
+    try:
+        rows = _client().query(
+            f"""
+            SELECT ticker
+            FROM `{_training_ticker_table()}`
+            WHERE is_active IS TRUE
+            ORDER BY sector, ticker
+            """
+        ).result()
+    except Exception as exc:
+        log.warning("Failed to read training tickers from %s: %s", _training_ticker_table(), exc)
+        return []
+
+    return [str(row.ticker).upper() for row in rows if getattr(row, "ticker", None)]
+
+
 def read_bigquery_raw() -> tuple[pd.DataFrame, pd.DataFrame]:
     client = _client()
     market_where = f"WHERE DATE(date) >= '{TRAINING_HISTORY_START}'" if TRAINING_HISTORY_START else ""
@@ -155,14 +183,14 @@ def read_bigquery_raw() -> tuple[pd.DataFrame, pd.DataFrame]:
     return market_df, news_df
 
 
-def _bootstrap_market_history() -> pd.DataFrame:
+def _bootstrap_market_history(tickers: list[str]) -> pd.DataFrame:
     if not BOOTSTRAP_MARKET_START:
         raise RuntimeError("BOOTSTRAP_MARKET_START is required when bootstrapping market history.")
     rows = []
     start_date = pd.Timestamp(BOOTSTRAP_MARKET_START)
     end_date = pd.Timestamp.utcnow().tz_localize(None)
 
-    for ticker in BOOTSTRAP_TICKERS:
+    for ticker in tickers:
         log.info("Bootstrapping Yahoo market history for %s ...", ticker)
         try:
             history = yf.Ticker(ticker).history(
@@ -183,7 +211,7 @@ def _bootstrap_market_history() -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
-def _bootstrap_news_history() -> pd.DataFrame:
+def _bootstrap_news_history(tickers: list[str]) -> pd.DataFrame:
     if BOOTSTRAP_NEWS_DAYS is None:
         raise RuntimeError("BOOTSTRAP_NEWS_DAYS is required when bootstrapping news history.")
     if not FINNHUB_KEY:
@@ -194,7 +222,7 @@ def _bootstrap_news_history() -> pd.DataFrame:
     end_date = datetime.now(timezone.utc)
     start_date = end_date - pd.Timedelta(days=BOOTSTRAP_NEWS_DAYS)
 
-    for ticker in BOOTSTRAP_TICKERS:
+    for ticker in tickers:
         log.info("Bootstrapping Finnhub company news for %s ...", ticker)
         try:
             response = requests.get(
@@ -243,7 +271,6 @@ def _load_bootstrap_frames_to_bigquery(market_df: pd.DataFrame, news_df: pd.Data
         market_to_load["date"] = pd.to_datetime(market_to_load["date"]).dt.to_pydatetime()
         client.load_table_from_dataframe(
             market_to_load,
-            BQ_MARKET_TABLE,
             _market_table(),
             job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
         ).result()
@@ -267,10 +294,13 @@ def ensure_raw_training_data() -> tuple[pd.DataFrame, pd.DataFrame]:
         return market_df, news_df
 
     log.warning("Raw BigQuery tables are empty. Bootstrapping baseline history from live providers.")
-    if not BOOTSTRAP_TICKERS:
-        raise RuntimeError("TRAINING_TICKERS is required when bootstrapping raw training data.")
-    bootstrap_market = _bootstrap_market_history()
-    bootstrap_news = _bootstrap_news_history()
+    bootstrap_tickers = _resolve_bootstrap_tickers()
+    if not bootstrap_tickers:
+        raise RuntimeError(
+            "TRAINING_TICKERS is not configured and training_tickers BigQuery table is empty."
+        )
+    bootstrap_market = _bootstrap_market_history(bootstrap_tickers)
+    bootstrap_news = _bootstrap_news_history(bootstrap_tickers)
     if bootstrap_market.empty:
         raise RuntimeError("Unable to bootstrap baseline market history from Yahoo.")
 

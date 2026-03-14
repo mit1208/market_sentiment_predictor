@@ -33,6 +33,7 @@ Core tables:
 
 - `raw_market_data`
 - `raw_news_data`
+- `training_tickers`
 - `training_feature_snapshots`
 - `live_feature_snapshots`
 - `model_metadata`
@@ -41,6 +42,7 @@ Core tables:
 
 Snapshot storage is split by purpose:
 
+- `training_tickers` is the BigQuery source of truth for the active training universe
 - `training_feature_snapshots` stores historical backfill rows used by training
 - `live_feature_snapshots` stores endpoint and batch inference audit rows
 - historical rows are written with `snapshot_source = historical_backfill`
@@ -72,6 +74,8 @@ Use the `Makefile` from the project root.
 
 Infrastructure code now lives under `infra/terraform`, while runtime code is split into
 `frontend/` and `backend/`.
+
+For a brand new GCP project, bootstrap it once from [`infra/terraform/bootstrap`](/Users/mitpatel/Desktop/code-exam/market_sentiment_predictor/infra/terraform/bootstrap/README.md). After the main Terraform stack is applied, the `Makefile` automatically reads the project ID, region, Artifact Registry repo, and model bucket from Terraform outputs when available.
 
 Initial schema update:
 
@@ -106,7 +110,7 @@ make verify-endpoint
 Send one live prediction request:
 
 ```bash
-PREDICT_API_URL=https://...a.run.app make test-live-predict TICKER=AAPL
+PREDICT_API_URL=https://...a.run.app/predict make test-live-predict TICKER=AAPL
 ```
 
 Full rollout:

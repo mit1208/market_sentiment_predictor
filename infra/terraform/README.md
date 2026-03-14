@@ -29,6 +29,8 @@ GCP infrastructure and packaging glue between them.
 *   Google Cloud SDK authenticated (`gcloud auth application-default login`)
 *   A local `terraform.tfvars` created from `terraform.tfvars.example`
 
+If you need a brand new GCP project, bootstrap it first from [`bootstrap/`](./bootstrap).
+
 ## Usage
 
 1.  Initialize Terraform:
@@ -48,6 +50,13 @@ GCP infrastructure and packaging glue between them.
     terraform apply
     ```
 
+For the very first apply in a brand-new project, set `bootstrap_with_placeholder_images = true`
+so Terraform can create the Cloud Run jobs and service before your own Docker images exist in
+Artifact Registry. After you push real images with the root `Makefile`, switch it back to `false`
+or omit it.
+
+After apply, the root [`Makefile`](/Users/mitpatel/Desktop/code-exam/market_sentiment_predictor/Makefile) reads `project_id`, `region`, `artifact_registry_repo`, and `model_artifacts_bucket` from Terraform outputs when available, so deploy commands target the provisioned project automatically.
+
 Inference is served only from Cloud Run. Vertex AI serving resources are not part of the managed architecture anymore.
 
 ## Monorepo Wiring
@@ -62,8 +71,8 @@ Inference is served only from Cloud Run. Vertex AI serving resources are not par
 Since the resources were previously created manually, you may want to import them into Terraform state to avoid conflicts:
 
 ```bash
-terraform import google_bigquery_dataset.main llm-testing-489113:market_sentiment_predictor
-terraform import google_cloudfunctions2_function.function projects/llm-testing-489113/locations/us-central1/functions/market-data-ingestion
+terraform import google_bigquery_dataset.main mkt-sent-friend-260313-225751:market_sentiment_predictor
+terraform import google_cloudfunctions2_function.function projects/mkt-sent-friend-260313-225751/locations/us-central1/functions/market-data-ingestion
 ```
 
 Keep `terraform.tfvars` local only. It is ignored by Git because it can contain secrets and

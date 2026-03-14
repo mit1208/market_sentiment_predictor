@@ -1,3 +1,18 @@
+output "project_id" {
+  description = "Target GCP project for the application stack"
+  value       = var.project_id
+}
+
+output "region" {
+  description = "Region used by the application stack"
+  value       = var.region
+}
+
+output "dataset_id" {
+  description = "BigQuery dataset used by the application stack"
+  value       = var.dataset_id
+}
+
 output "ingestion_function_uri" {
   description = "Ingress URL for the ingestion Cloud Function"
   value       = google_cloudfunctions2_function.function.service_config[0].uri
