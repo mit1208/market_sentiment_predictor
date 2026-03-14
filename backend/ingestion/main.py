@@ -3,7 +3,49 @@ import logging
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
-from backend.config import get_csv_env, get_env, get_int_env, qualify_table_name
+try:
+    from backend.config import get_csv_env, get_env, get_int_env, qualify_table_name
+except ImportError:
+    # Cloud Functions deploys only the ingestion source directory, so provide
+    # local fallbacks when the shared backend package is not bundled.
+    def get_env(*names: str, default: str = "") -> str:
+        for name in names:
+            value = os.getenv(name)
+            if value is None:
+                continue
+            normalized = value.strip()
+            if normalized:
+                return normalized
+        return default
+
+    def get_required_env(*names: str) -> str:
+        value = get_env(*names)
+        if value:
+            return value
+        readable_names = ", ".join(names)
+        raise RuntimeError(f"Missing required configuration. Set one of: {readable_names}.")
+
+    def get_int_env(*names: str, default: int | None = None) -> int | None:
+        value = get_env(*names)
+        if not value:
+            return default
+        return int(value)
+
+    def get_csv_env(*names: str) -> list[str]:
+        value = get_env(*names)
+        if not value:
+            return []
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    def qualify_table_name(
+        table_name: str,
+        *,
+        project_id: str | None = None,
+        dataset_id: str | None = None,
+    ) -> str:
+        resolved_project_id = project_id or get_required_env("GCP_PROJECT_ID")
+        resolved_dataset_id = dataset_id or get_required_env("BQ_DATASET", "BQ_DATASET_ID")
+        return f"{resolved_project_id}.{resolved_dataset_id}.{table_name}"
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +67,33 @@ def _table_id(table_name: str) -> str:
         project_id=PROJECT_ID or None,
         dataset_id=DATASET_ID or None,
     )
+
+
+def _training_ticker_table() -> str:
+    return _table_id("training_tickers")
+
+
+def _resolve_tickers() -> list[str]:
+    if TICKERS:
+        return [ticker.upper() for ticker in TICKERS]
+
+    try:
+        from google.cloud import bigquery
+
+        client = bigquery.Client(project=PROJECT_ID or None)
+        rows = client.query(
+            f"""
+            SELECT ticker
+            FROM `{_training_ticker_table()}`
+            WHERE is_active IS TRUE
+            ORDER BY sector, ticker
+            """
+        ).result()
+    except Exception as exc:
+        logger.warning("Failed to read training tickers from %s: %s", _training_ticker_table(), exc)
+        return []
+
+    return [str(row.ticker).upper() for row in rows if getattr(row, "ticker", None)]
 
 
 def table_has_rows(table_name):
@@ -256,18 +325,21 @@ def trigger_training_job():
 def run_ingestion(request=None):
     """Main entry point for the ingestion Cloud Function (2nd Gen HTTP)."""
     logger.info("Starting automated data ingestion...")
-    if not TICKERS:
-        raise RuntimeError("Set INGESTION_TICKERS or TRAINING_TICKERS before running ingestion.")
+    tickers = _resolve_tickers()
+    if not tickers:
+        raise RuntimeError(
+            "Set INGESTION_TICKERS/TRAINING_TICKERS or populate the training_tickers BigQuery table."
+        )
     bootstrap_market = not table_has_rows("raw_market_data")
     bootstrap_news = not table_has_rows("raw_news_data")
 
     # Fetch Market Data
-    market_df = fetch_market_data_df(TICKERS, bootstrap=bootstrap_market)
+    market_df = fetch_market_data_df(tickers, bootstrap=bootstrap_market)
     if not market_df.empty:
         load_with_merge(market_df, "raw_market_data", ["date", "ticker"])
 
     # Fetch News Data
-    news_df = fetch_news_data_df(TICKERS, bootstrap=bootstrap_news)
+    news_df = fetch_news_data_df(tickers, bootstrap=bootstrap_news)
     if not news_df.empty:
         # Use URL and Ticker as unique key for news
         load_with_merge(news_df, "raw_news_data", ["url", "ticker"])

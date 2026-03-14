@@ -22,8 +22,8 @@ locals {
   batch_job_name          = "market-sentiment-batch-infer"
   training_job_name       = "market-sentiment-train"
   prediction_service_name = "market-sentiment-predict"
-  endpoint_image_uri      = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.market_sentiment.repository_id}/endpoint:latest"
-  training_image_uri      = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.market_sentiment.repository_id}/pipeline:latest"
+  endpoint_image_uri      = var.bootstrap_with_placeholder_images ? var.bootstrap_placeholder_image_uri : "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.market_sentiment.repository_id}/endpoint:latest"
+  training_image_uri      = var.bootstrap_with_placeholder_images ? var.bootstrap_placeholder_image_uri : "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.market_sentiment.repository_id}/pipeline:latest"
 }
 
 resource "google_project_service" "apis" {

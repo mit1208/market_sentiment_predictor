@@ -3,12 +3,24 @@ include .env
 export FINNHUB_KEY
 endif
 
-PROJECT_ID ?= llm-testing-489113
-REGION ?= us-central1
-BQ_DATASET_ID ?= market_sentiment_predictor
-REPO ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/market-sentiment
-GCS_BUCKET ?= llm-testing-489113-model-artifacts-01783489
+TF_DIR ?= infra/terraform
+BOOTSTRAP_TF_DIR ?= infra/terraform/bootstrap
+
+TF_PROJECT_ID := $(shell terraform -chdir=$(TF_DIR) output -raw project_id 2>/dev/null)
+TF_REGION := $(shell terraform -chdir=$(TF_DIR) output -raw region 2>/dev/null)
+TF_DATASET_ID := $(shell terraform -chdir=$(TF_DIR) output -raw dataset_id 2>/dev/null)
+TF_REPO := $(shell terraform -chdir=$(TF_DIR) output -raw artifact_registry_repo 2>/dev/null)
+TF_GCS_BUCKET := $(shell terraform -chdir=$(TF_DIR) output -raw model_artifacts_bucket 2>/dev/null)
+
+PROJECT_ID ?= $(if $(TF_PROJECT_ID),$(TF_PROJECT_ID),mkt-sent-friend-260313-225751)
+REGION ?= $(if $(TF_REGION),$(TF_REGION),us-central1)
+BQ_DATASET_ID ?= $(if $(TF_DATASET_ID),$(TF_DATASET_ID),market_sentiment_predictor)
+REPO ?= $(if $(TF_REPO),$(TF_REPO),$(REGION)-docker.pkg.dev/$(PROJECT_ID)/market-sentiment)
+GCS_BUCKET ?= $(if $(TF_GCS_BUCKET),$(TF_GCS_BUCKET),mkt-sent-friend-260313-225751-model-artifacts-7cace324)
 PIPELINE_SERVICE_ACCOUNT ?= market-sentiment-sa@$(PROJECT_ID).iam.gserviceaccount.com
+TRAINING_TICKERS ?=
+BOOTSTRAP_MARKET_START ?=
+BOOTSTRAP_NEWS_DAYS ?=
 
 PIPELINE_IMAGE ?= $(REPO)/pipeline:latest
 ENDPOINT_IMAGE ?= $(REPO)/endpoint:latest
@@ -17,14 +29,37 @@ TRAIN_JOB ?= market-sentiment-train
 BATCH_JOB ?= market-sentiment-batch-infer
 PREDICT_SERVICE ?= market-sentiment-predict
 INGEST_FUNCTION ?= market-data-ingestion
-PREDICT_HEALTH_URL ?= $$(gcloud run services describe $(PREDICT_SERVICE) --region=$(REGION) --format='value(status.url)')/health
+PREDICT_HEALTH_URL ?= $$(gcloud run services describe $(PREDICT_SERVICE) --project=$(PROJECT_ID) --region=$(REGION) --format='value(status.url)')/health
+GCLOUD_ENV_DELIM := ^@^
+TRAINING_TICKERS_ENV := $(if $(TRAINING_TICKERS),@TRAINING_TICKERS=$(TRAINING_TICKERS),)
+TRAINING_TICKERS_REMOVE_ARGS := $(if $(TRAINING_TICKERS),,--remove-env-vars TRAINING_TICKERS)
+TRAINING_ENV_VARS := GCP_PROJECT_ID=$(PROJECT_ID)@GCP_REGION=$(REGION)@BQ_DATASET=$(BQ_DATASET_ID)@GCS_BUCKET=$(GCS_BUCKET)@MIN_ACCURACY=0.50@MODEL_NAME=market_sentiment_lgbm@FINNHUB_KEY=$(FINNHUB_KEY)$(TRAINING_TICKERS_ENV)@BOOTSTRAP_MARKET_START=$(BOOTSTRAP_MARKET_START)@BOOTSTRAP_NEWS_DAYS=$(BOOTSTRAP_NEWS_DAYS)
+INGESTION_ENV_VARS := GCP_PROJECT_ID=$(PROJECT_ID)@GCP_REGION=$(REGION)@BQ_DATASET_ID=$(BQ_DATASET_ID)@TRAINING_JOB_NAME=$(TRAIN_JOB)@FINNHUB_KEY=$(FINNHUB_KEY)$(TRAINING_TICKERS_ENV)@BOOTSTRAP_MARKET_START=$(BOOTSTRAP_MARKET_START)@BOOTSTRAP_NEWS_DAYS=$(BOOTSTRAP_NEWS_DAYS)
 
-.PHONY: auth build-pipeline build-endpoint ensure-train-job update-pipeline-jobs update-endpoint-service deploy-pipeline deploy-endpoint deploy-function ingest train verify-endpoint test test-ml test-all test-live-predict scan-secrets rollout migrate
+.PHONY: auth bootstrap-init bootstrap-plan bootstrap-apply infra-init infra-plan infra-apply build-pipeline build-endpoint ensure-train-job update-pipeline-jobs update-endpoint-service deploy-pipeline deploy-endpoint deploy-function ingest train verify-endpoint test test-ml test-all test-live-predict scan-secrets rollout migrate
 
 SECRET_GREP_PATTERN := AIza[0-9A-Za-z_-]{35}|sk-[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|ya29\.[A-Za-z0-9._-]+
 
 auth:
 	gcloud auth configure-docker $(REGION)-docker.pkg.dev --quiet
+
+bootstrap-init:
+	terraform -chdir=$(BOOTSTRAP_TF_DIR) init
+
+bootstrap-plan:
+	terraform -chdir=$(BOOTSTRAP_TF_DIR) plan
+
+bootstrap-apply:
+	terraform -chdir=$(BOOTSTRAP_TF_DIR) apply
+
+infra-init:
+	terraform -chdir=$(TF_DIR) init
+
+infra-plan:
+	terraform -chdir=$(TF_DIR) plan
+
+infra-apply:
+	terraform -chdir=$(TF_DIR) apply
 
 build-pipeline:
 	docker buildx build --platform linux/amd64 -f backend/ml/Dockerfile -t $(PIPELINE_IMAGE) --push .
@@ -33,11 +68,12 @@ build-endpoint:
 	docker buildx build --platform linux/amd64 -f backend/api/Dockerfile -t $(ENDPOINT_IMAGE) --push .
 
 ensure-train-job:
-	@if gcloud run jobs describe $(TRAIN_JOB) --region=$(REGION) >/dev/null 2>&1; then \
+	@if gcloud run jobs describe $(TRAIN_JOB) --project=$(PROJECT_ID) --region=$(REGION) >/dev/null 2>&1; then \
 		echo "Cloud Run job $(TRAIN_JOB) already exists."; \
 	else \
 		echo "Creating Cloud Run job $(TRAIN_JOB)..."; \
 		gcloud run jobs create $(TRAIN_JOB) \
+			--project=$(PROJECT_ID) \
 			--image $(PIPELINE_IMAGE) \
 			--region=$(REGION) \
 			--command python \
@@ -47,26 +83,27 @@ ensure-train-job:
 			--max-retries 0 \
 			--task-timeout 3600 \
 			--service-account $(PIPELINE_SERVICE_ACCOUNT) \
-			--set-env-vars GCP_PROJECT_ID=$(PROJECT_ID),GCP_REGION=$(REGION),BQ_DATASET=$(BQ_DATASET_ID),GCS_BUCKET=$(GCS_BUCKET),MIN_ACCURACY=0.50,MODEL_NAME=market_sentiment_lgbm,FINNHUB_KEY=$(FINNHUB_KEY); \
+			--set-env-vars "$(GCLOUD_ENV_DELIM)$(TRAINING_ENV_VARS)"; \
 	fi
 
 update-pipeline-jobs:
 	$(MAKE) ensure-train-job
-	gcloud run jobs update $(TRAIN_JOB) --image $(PIPELINE_IMAGE) --region=$(REGION) --update-env-vars FINNHUB_KEY=$(FINNHUB_KEY)
-	gcloud run jobs update $(BATCH_JOB) --image $(PIPELINE_IMAGE) --region=$(REGION) --update-env-vars FINNHUB_KEY=$(FINNHUB_KEY)
+	gcloud run jobs update $(TRAIN_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) $(TRAINING_TICKERS_REMOVE_ARGS) --update-env-vars "$(GCLOUD_ENV_DELIM)$(TRAINING_ENV_VARS)"
+	gcloud run jobs update $(BATCH_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) --update-env-vars FINNHUB_KEY=$(FINNHUB_KEY)
 
 deploy-pipeline: auth build-pipeline update-pipeline-jobs
 
 train:
-	gcloud run jobs execute $(TRAIN_JOB) --region=$(REGION) --wait
+	gcloud run jobs execute $(TRAIN_JOB) --project=$(PROJECT_ID) --region=$(REGION) --wait
 
 update-endpoint-service:
-	gcloud run services update $(PREDICT_SERVICE) --image $(ENDPOINT_IMAGE) --region=$(REGION) --update-env-vars FINNHUB_KEY=$(FINNHUB_KEY)
+	gcloud run services update $(PREDICT_SERVICE) --project=$(PROJECT_ID) --image $(ENDPOINT_IMAGE) --region=$(REGION) --update-env-vars FINNHUB_KEY=$(FINNHUB_KEY)
 
 deploy-endpoint: auth build-endpoint update-endpoint-service
 
 deploy-function:
 	gcloud functions deploy $(INGEST_FUNCTION) \
+		--project=$(PROJECT_ID) \
 		--gen2 \
 		--region=$(REGION) \
 		--runtime=python311 \
@@ -77,10 +114,10 @@ deploy-function:
 		--service-account=$(PIPELINE_SERVICE_ACCOUNT) \
 		--memory=1Gi \
 		--timeout=540s \
-		--set-env-vars GCP_PROJECT_ID=$(PROJECT_ID),GCP_REGION=$(REGION),BQ_DATASET_ID=$(BQ_DATASET_ID),TRAINING_JOB_NAME=$(TRAIN_JOB),FINNHUB_KEY=$(FINNHUB_KEY)
+		--set-env-vars "$(GCLOUD_ENV_DELIM)$(INGESTION_ENV_VARS)"
 
 ingest:
-	gcloud functions call $(INGEST_FUNCTION) --region=$(REGION) --gen2
+	gcloud functions call $(INGEST_FUNCTION) --project=$(PROJECT_ID) --region=$(REGION) --gen2
 
 verify-endpoint:
 	curl -sSf $(PREDICT_HEALTH_URL)
@@ -150,4 +187,4 @@ migrate: up
 rollback: down
 
 # rollout: Deploy the full pipeline including database migrations and data refresh
-rollout: migrate deploy-function ingest deploy-pipeline train deploy-endpoint verify-endpoint
+rollout: migrate deploy-pipeline deploy-function ingest train deploy-endpoint verify-endpoint

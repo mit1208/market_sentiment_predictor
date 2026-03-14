@@ -160,7 +160,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "llm-testing-489113")
+PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "mkt-sent-friend-260313-225751")
 REGION = os.environ.get("GCP_REGION", "us-central1")
 DATASET_ID = os.environ.get("BQ_DATASET", "market_sentiment_predictor")
 GCS_BUCKET = os.environ.get("GCS_BUCKET", f"{PROJECT_ID}-model-artifacts")
@@ -582,7 +582,7 @@ from google.cloud import aiplatform, bigquery
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 log = logging.getLogger(__name__)
 
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "llm-testing-489113")
+PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "mkt-sent-friend-260313-225751")
 REGION = os.environ.get("GCP_REGION", "us-central1")
 DATASET_ID = os.environ.get("BQ_DATASET", "market_sentiment_predictor")
 VERTEX_ENDPOINT_ID = os.environ.get("VERTEX_ENDPOINT_ID", "")
@@ -714,7 +714,7 @@ PIPELINE_IMAGE = ""  # Set at compile time or via env var
 import os
 PIPELINE_IMAGE = os.environ.get(
     "PIPELINE_IMAGE",
-    "us-central1-docker.pkg.dev/llm-testing-489113/market-sentiment/pipeline:latest",
+    "us-central1-docker.pkg.dev/mkt-sent-friend-260313-225751/market-sentiment/pipeline:latest",
 )
 
 

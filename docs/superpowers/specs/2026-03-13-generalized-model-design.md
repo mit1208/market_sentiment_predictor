@@ -32,7 +32,7 @@ continuing feature/generalization work rather than treating the current feature 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  GCP (project: llm-testing-489113, region: us-central1)             │
+│  GCP (project: mkt-sent-friend-260313-225751, region: us-central1)  │
 │                                                                     │
 │  Cloud Scheduler (Sunday 00:00 UTC)                                 │
 │    └─► Cloud Function v2 (market-data-ingestion)                   │

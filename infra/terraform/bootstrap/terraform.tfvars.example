@@ -1,0 +1,7 @@
+project_id         = "your-new-project-id"
+project_name       = "Market Sentiment Friend Project"
+billing_account_id = "000000-000000-000000"
+folder_id          = null
+organization_id    = null
+friend_user_email  = null
+friend_project_role = "roles/editor"

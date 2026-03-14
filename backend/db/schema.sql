@@ -3,7 +3,7 @@
 -- Database schema
 --
 
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.engineered_features`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.engineered_features`
 (
   date DATE NOT NULL,
   ticker STRING NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE `llm-testing-489113.market_sentiment_predictor.engineered_features`
   target INT64
 )
 PARTITION BY date;
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.raw_news_data`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.raw_news_data`
 (
   date DATETIME,
   timestamp TIMESTAMP,
@@ -47,7 +47,7 @@ CREATE TABLE `llm-testing-489113.market_sentiment_predictor.raw_news_data`
   url STRING
 )
 PARTITION BY DATE(date);
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.raw_market_data`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.raw_market_data`
 (
   date DATETIME,
   ticker STRING,
@@ -58,7 +58,7 @@ CREATE TABLE `llm-testing-489113.market_sentiment_predictor.raw_market_data`
   volume INT64
 )
 PARTITION BY DATE(date);
-CREATE VIEW `llm-testing-489113.market_sentiment_predictor.vw_technical_summary`
+CREATE VIEW `mkt-sent-friend-260313-225751.market_sentiment_predictor.vw_technical_summary`
 AS SELECT
   date,
   ticker,
@@ -69,9 +69,9 @@ AS SELECT
   ROUND(price_vs_sma5, 4) as vs_sma5,
   ROUND(price_vs_sma10, 4) as vs_sma10,
   ROUND(volume_ratio_5d, 2) as vol_ratio
-FROM `llm-testing-489113.market_sentiment_predictor.engineered_features`
+FROM `mkt-sent-friend-260313-225751.market_sentiment_predictor.engineered_features`
 WHERE date IS NOT NULL;
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.model_metadata`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.model_metadata`
 (
   model_id STRING NOT NULL,
   version STRING NOT NULL,
@@ -92,7 +92,7 @@ CREATE TABLE `llm-testing-489113.market_sentiment_predictor.model_metadata`
   notes STRING,
   created_by STRING
 );
-CREATE VIEW `llm-testing-489113.market_sentiment_predictor.vw_model_performance`
+CREATE VIEW `mkt-sent-friend-260313-225751.market_sentiment_predictor.vw_model_performance`
 AS SELECT
   model_id,
   version,
@@ -104,9 +104,9 @@ AS SELECT
   feature_count,
   training_samples,
   JSON_EXTRACT_SCALAR(performance_metrics, '$.deployment_status') as deployment_status
-FROM `llm-testing-489113.market_sentiment_predictor.model_metadata`
+FROM `mkt-sent-friend-260313-225751.market_sentiment_predictor.model_metadata`
 ORDER BY training_date DESC;
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.live_feature_snapshots`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.live_feature_snapshots`
 (
   snapshot_id STRING NOT NULL,
   request_id STRING,
@@ -158,7 +158,7 @@ CREATE TABLE `llm-testing-489113.market_sentiment_predictor.live_feature_snapsho
 )
 PARTITION BY snapshot_date
 CLUSTER BY snapshot_source, ticker;
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.batch_inference_predictions`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.batch_inference_predictions`
 (
   request_id STRING,
   batch_id STRING,
@@ -169,11 +169,11 @@ CREATE TABLE `llm-testing-489113.market_sentiment_predictor.batch_inference_pred
   model_version STRING,
   processed_at TIMESTAMP
 );
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.schema_migrations`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.schema_migrations`
 (
   version STRING
 );
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.training_feature_snapshots`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.training_feature_snapshots`
 (
   snapshot_id STRING NOT NULL,
   request_id STRING,
@@ -225,7 +225,7 @@ CREATE TABLE `llm-testing-489113.market_sentiment_predictor.training_feature_sna
 )
 PARTITION BY snapshot_date
 CLUSTER BY snapshot_source, ticker;
-CREATE VIEW `llm-testing-489113.market_sentiment_predictor.vw_sentiment_daily_summary`
+CREATE VIEW `mkt-sent-friend-260313-225751.market_sentiment_predictor.vw_sentiment_daily_summary`
 AS SELECT
   date,
   ticker,
@@ -237,10 +237,10 @@ AS SELECT
   ROUND(sentiment_negative_ratio, 3) as pct_negative,
   news_count,
   ROUND(news_volume_ratio, 2) as relative_coverage
-FROM `llm-testing-489113.market_sentiment_predictor.engineered_features`
+FROM `mkt-sent-friend-260313-225751.market_sentiment_predictor.engineered_features`
 WHERE date IS NOT NULL
   AND sentiment_mean IS NOT NULL;
-CREATE TABLE `llm-testing-489113.market_sentiment_predictor.batch_inference_requests`
+CREATE TABLE `mkt-sent-friend-260313-225751.market_sentiment_predictor.batch_inference_requests`
 (
   request_id STRING,
   batch_id STRING,
