@@ -17,13 +17,16 @@ locals {
     "storage.googleapis.com",
     "artifactregistry.googleapis.com",
     "iam.googleapis.com",
+    "aiplatform.googleapis.com",
   ]
 
-  batch_job_name          = "market-sentiment-batch-infer"
-  training_job_name       = "market-sentiment-train"
-  prediction_service_name = "market-sentiment-predict"
-  endpoint_image_uri      = var.bootstrap_with_placeholder_images ? var.bootstrap_placeholder_image_uri : "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.market_sentiment.repository_id}/endpoint:latest"
-  training_image_uri      = var.bootstrap_with_placeholder_images ? var.bootstrap_placeholder_image_uri : "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.market_sentiment.repository_id}/pipeline:latest"
+  batch_job_name                = "market-sentiment-batch-infer"
+  feature_rank_submit_job_name  = "market-sentiment-feature-rank-submit"
+  feature_rank_finalize_job_name = "market-sentiment-feature-rank-finalize"
+  training_job_name             = "market-sentiment-train"
+  prediction_service_name       = "market-sentiment-predict"
+  endpoint_image_uri            = var.bootstrap_with_placeholder_images ? var.bootstrap_placeholder_image_uri : "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.market_sentiment.repository_id}/endpoint:latest"
+  training_image_uri            = var.bootstrap_with_placeholder_images ? var.bootstrap_placeholder_image_uri : "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.market_sentiment.repository_id}/pipeline:latest"
 }
 
 resource "google_project_service" "apis" {
@@ -196,6 +199,8 @@ resource "google_project_iam_member" "ml_sa_roles" {
     "roles/storage.objectAdmin",
     "roles/logging.logWriter",
     "roles/run.developer",
+    "roles/aiplatform.user",
+    "roles/serviceusage.serviceUsageConsumer",
     # Needed so Cloud Scheduler can invoke the Cloud Function (Cloud Run backed)
     "roles/run.invoker",
     # Needed so Cloud Scheduler can trigger the Cloud Run Job
@@ -246,12 +251,17 @@ resource "google_cloud_run_v2_job" "training" {
 
         env {
           name  = "MIN_ACCURACY"
-          value = "0.50"
+          value = "0.52"
         }
 
         env {
           name  = "MODEL_PROMOTION_MODE"
           value = "threshold_manifest"
+        }
+
+        env {
+          name  = "FEATURE_RANK_NOTIFICATION_WEBHOOK"
+          value = var.feature_rank_notification_webhook
         }
 
         resources {
@@ -268,7 +278,114 @@ resource "google_cloud_run_v2_job" "training" {
 }
 
 # ---------------------------------------------------------------------------
-# 8. Cloud Run Job — batch inference
+# 8. Cloud Run Job — feature ranking submit
+# ---------------------------------------------------------------------------
+
+resource "google_cloud_run_v2_job" "feature_ranking_submit" {
+  name     = local.feature_rank_submit_job_name
+  location = var.region
+
+  template {
+    template {
+      service_account = google_service_account.ml_sa.email
+      max_retries     = 0
+      timeout         = "3600s"
+
+      containers {
+        image   = local.training_image_uri
+        command = ["python", "-m", "backend.ml.training.feature_ranking_submit_job"]
+
+        env {
+          name  = "GCP_PROJECT_ID"
+          value = var.project_id
+        }
+
+        env {
+          name  = "GCP_REGION"
+          value = var.region
+        }
+
+        env {
+          name  = "BQ_DATASET"
+          value = var.dataset_id
+        }
+
+        env {
+          name  = "GCS_BUCKET"
+          value = google_storage_bucket.model_artifacts.name
+        }
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "4Gi"
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# ---------------------------------------------------------------------------
+# 9. Cloud Run Job — feature ranking finalize
+# ---------------------------------------------------------------------------
+
+resource "google_cloud_run_v2_job" "feature_ranking_finalize" {
+  name     = local.feature_rank_finalize_job_name
+  location = var.region
+
+  template {
+    template {
+      service_account = google_service_account.ml_sa.email
+      max_retries     = 0
+      timeout         = "3600s"
+
+      containers {
+        image   = local.training_image_uri
+        command = ["python", "-m", "backend.ml.training.feature_ranking_finalize_job"]
+
+        env {
+          name  = "GCP_PROJECT_ID"
+          value = var.project_id
+        }
+
+        env {
+          name  = "GCP_REGION"
+          value = var.region
+        }
+
+        env {
+          name  = "BQ_DATASET"
+          value = var.dataset_id
+        }
+
+        env {
+          name  = "GCS_BUCKET"
+          value = google_storage_bucket.model_artifacts.name
+        }
+
+        env {
+          name  = "FEATURE_RANK_NOTIFICATION_WEBHOOK"
+          value = var.feature_rank_notification_webhook
+        }
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "4Gi"
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# ---------------------------------------------------------------------------
+# 10. Cloud Run Job — batch inference
 # ---------------------------------------------------------------------------
 
 resource "google_cloud_run_v2_job" "batch_inference" {
@@ -288,6 +405,11 @@ resource "google_cloud_run_v2_job" "batch_inference" {
         env {
           name  = "GCP_PROJECT_ID"
           value = var.project_id
+        }
+
+        env {
+          name  = "GCP_REGION"
+          value = var.region
         }
 
         env {
@@ -312,7 +434,17 @@ resource "google_cloud_run_v2_job" "batch_inference" {
 
         env {
           name  = "BATCH_RUNTIME_VERSION"
-          value = "20260313-mergefix"
+          value = "20260314-fast-accuracy-pass"
+        }
+
+        env {
+          name  = "FINNHUB_KEY"
+          value = var.finnhub_key
+        }
+
+        env {
+          name  = "FRED_API_KEY"
+          value = var.fred_api_key
         }
 
         resources {
@@ -329,7 +461,7 @@ resource "google_cloud_run_v2_job" "batch_inference" {
 }
 
 # ---------------------------------------------------------------------------
-# 9. Cloud Run Service — online prediction API
+# 11. Cloud Run Service — online prediction API
 # ---------------------------------------------------------------------------
 
 resource "google_cloud_run_v2_service" "prediction_api" {
@@ -377,6 +509,16 @@ resource "google_cloud_run_v2_service" "prediction_api" {
       }
 
       env {
+        name  = "FINNHUB_KEY"
+        value = var.finnhub_key
+      }
+
+      env {
+        name  = "FRED_API_KEY"
+        value = var.fred_api_key
+      }
+
+      env {
         name  = "INFERENCE_BACKEND"
         value = "cloud_run"
       }
@@ -402,13 +544,13 @@ resource "google_cloud_run_v2_service_iam_member" "prediction_public_invoker" {
 }
 
 # ---------------------------------------------------------------------------
-# 10. Cloud Function v2 — data ingestion
+# 12. Cloud Function v2 — data ingestion
 # ---------------------------------------------------------------------------
 
 resource "google_cloudfunctions2_function" "function" {
   name        = "market-data-ingestion"
   location    = var.region
-  description = "Automated market and news data ingestion that triggers the training job"
+  description = "Automated bronze ingestion for market, news, and macro data"
 
   build_config {
     runtime     = "python311"
@@ -428,10 +570,11 @@ resource "google_cloudfunctions2_function" "function" {
     available_cpu         = "1"
     timeout_seconds       = 540
     environment_variables = {
-      GCP_PROJECT_ID    = var.project_id
-      GCP_REGION        = var.region
-      BQ_DATASET_ID     = var.dataset_id
-      TRAINING_JOB_NAME = local.training_job_name
+      GCP_PROJECT_ID = var.project_id
+      GCP_REGION     = var.region
+      BQ_DATASET_ID  = var.dataset_id
+      FINNHUB_KEY    = var.finnhub_key
+      FRED_API_KEY   = var.fred_api_key
     }
     ingress_settings = "ALLOW_ALL"
   }
@@ -441,7 +584,7 @@ resource "google_cloudfunctions2_function" "function" {
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 11. Cloud Scheduler — weekly ingestion (every Sunday at midnight)
+# 13. Cloud Scheduler — weekly ingestion (every Sunday at midnight)
 # ---------------------------------------------------------------------------
 
 resource "google_cloud_scheduler_job" "weekly_ingestion" {

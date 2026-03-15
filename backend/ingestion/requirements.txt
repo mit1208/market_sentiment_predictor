@@ -6,3 +6,4 @@ yfinance
 pyarrow
 pandas-gbq
 PyYAML
+fredapi

@@ -8,11 +8,17 @@ from typing import Any
 
 import pandas as pd
 
-from backend.ml.shared.feature_engineering import BASE_FEATURE_NAMES
+from backend.ml.shared.feature_engineering import (
+    CANDIDATE_FEATURE_NAMES,
+    coerce_scalarlike,
+    is_missing_value,
+)
 
 SNAPSHOT_SOURCE_HISTORICAL = "historical_backfill"
 SNAPSHOT_SOURCE_ENDPOINT = "endpoint_live_api"
 SNAPSHOT_SOURCE_BATCH = "batch_live_api"
+SNAPSHOT_SOURCE_ENDPOINT_CACHE = "endpoint_bigquery_cache"
+SNAPSHOT_SOURCE_BATCH_CACHE = "batch_bigquery_cache"
 
 
 def build_snapshot_id(prefix: str, ticker: str, snapshot_timestamp: Any) -> str:
@@ -31,10 +37,9 @@ def _serialize_feature_snapshot(feature_snapshot: dict | None) -> str | None:
 
 
 def _coerce_json_scalar(value: Any) -> Any:
-    if value is None or pd.isna(value):
+    value = coerce_scalarlike(value)
+    if is_missing_value(value):
         return None
-    if hasattr(value, "item"):
-        return value.item()
     return value
 
 
@@ -49,6 +54,7 @@ def build_live_feature_snapshot_row(
     request_id: str | None = None,
     batch_id: str | None = None,
     target: int | None = None,
+    next_day_return: float | None = None,
     feature_snapshot: dict | None = None,
     quote_currency: str | None = None,
     model_artifact_uri: str | None = None,
@@ -78,11 +84,12 @@ def build_live_feature_snapshot_row(
         "snapshot_timestamp": snapshot_ts.isoformat(),
         "headlines_text": headlines_text,
         "target": target,
+        "next_day_return": _coerce_json_scalar(next_day_return),
         "feature_snapshot": _serialize_feature_snapshot(feature_snapshot),
         "snapshot_source": snapshot_source,
         "model_artifact_uri": model_artifact_uri,
         "created_at": created_ts.isoformat(),
     }
-    for feature_name in BASE_FEATURE_NAMES:
+    for feature_name in CANDIDATE_FEATURE_NAMES:
         row[feature_name] = _coerce_json_scalar(base_feature_values.get(feature_name))
     return row

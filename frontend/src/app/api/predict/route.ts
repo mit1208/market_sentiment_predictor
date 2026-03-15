@@ -37,6 +37,20 @@ function getPredictUrl(): string {
   return process.env.PREDICT_API_URL ?? "";
 }
 
+function getUpstreamErrorMessage(payload: unknown, status: number): string {
+  if (payload && typeof payload === "object") {
+    const obj = payload as Record<string, unknown>;
+    if (typeof obj.error === "string" && obj.error) return obj.error;
+    if (typeof obj.detail === "string" && obj.detail) return obj.detail;
+    if (Array.isArray(obj.detail) && obj.detail.length > 0) {
+      const first = obj.detail[0];
+      if (first && typeof first === "object" && "msg" in first && typeof (first as { msg: unknown }).msg === "string")
+        return (first as { msg: string }).msg;
+    }
+  }
+  return `Prediction request failed with HTTP ${status}.`;
+}
+
 function normalizeOptionalText(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -212,14 +226,7 @@ export async function POST(req: NextRequest) {
       : await upstream.text();
 
     if (!upstream.ok) {
-      const message =
-        typeof payload === "object" &&
-        payload &&
-        "error" in payload &&
-        typeof payload.error === "string"
-          ? payload.error
-          : `Prediction request failed with HTTP ${upstream.status}.`;
-
+      const message = getUpstreamErrorMessage(payload, upstream.status);
       return NextResponse.json(
         {
           error: message,

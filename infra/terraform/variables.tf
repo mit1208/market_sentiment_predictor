@@ -26,3 +26,24 @@ variable "bootstrap_placeholder_image_uri" {
   type        = string
   default     = "us-docker.pkg.dev/cloudrun/container/hello"
 }
+
+variable "finnhub_key" {
+  description = "Finnhub API key for market/news fetches"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "fred_api_key" {
+  description = "FRED API key for macro feature fetches"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "feature_rank_notification_webhook" {
+  description = "Optional webhook URL notified when AutoML feature ranking is ready for review"
+  type        = string
+  default     = ""
+  sensitive   = true
+}

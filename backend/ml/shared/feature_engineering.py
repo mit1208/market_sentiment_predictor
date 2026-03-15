@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import random
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from functools import lru_cache
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 log = logging.getLogger(__name__)
 
 NEWS_LOOKBACK_DAYS = 7
-TFIDF_MAX_FEATURES = 16
+LABEL_NOISE_THRESHOLD = 0.003
+CANDIDATE_FEATURE_VERSION = "2026-03-14-fast-accuracy-pass-v1"
+TEMPORARY_SELECTED_FEATURE_COUNT = 40
+TEMPORARY_FEATURE_SELECTION_SOURCE = "temporary_seeded_random_with_all_gemini"
+TEMPORARY_FEATURE_SELECTION_MODE = "seeded_random_subset"
+LIVE_NEWS_PROVIDERS = {"finnhub", "yahoo"}
+LIVE_NEWS_SENTIMENT_ITEMS_KEY = "_news_item_sentiments"
 
 MARKET_FEATURE_NAMES = [
     "current_price",
@@ -44,6 +54,31 @@ MARKET_FEATURE_NAMES = [
     "position_52w_range",
 ]
 
+TEMPORAL_FEATURE_NAMES = [
+    "return_1d",
+    "return_3d",
+    "return_5d",
+    "return_10d",
+    "return_20d",
+    "momentum_streak",
+    "volatility_regime",
+    "volume_trend_5d",
+    "price_acceleration",
+    "relative_strength_spy",
+]
+
+GEMINI_FEATURE_NAMES = [
+    "gemini_sentiment_avg",
+    "gemini_sentiment_max",
+    "gemini_sentiment_min",
+    "gemini_magnitude_avg",
+    "headline_count",
+    "has_earnings_news",
+    "has_analyst_news",
+    "sentiment_dispersion",
+    "sentiment_market_alignment",
+]
+
 MARKET_CONTEXT_FEATURE_NAMES = [
     "spy_change_pct",
     "spy_gap_pct",
@@ -51,27 +86,51 @@ MARKET_CONTEXT_FEATURE_NAMES = [
     "vix_change_pct",
 ]
 
-SENTIMENT_FEATURE_NAMES = [
-    "sentiment_score",
-    "headline_count",
-    "has_news",
-    "avg_news_age_hours",
-    "news_source_count",
+MACRO_FEATURE_NAMES = [
+    "yield_curve_spread",
+    "fed_funds_rate",
+    "fed_funds_change_3m",
+    "credit_spread",
+    "dxy_change_5d",
+    "universe_breadth_50d",
 ]
 
-TFIDF_FEATURE_NAMES = [f"tfidf_{idx}" for idx in range(TFIDF_MAX_FEATURES)]
+CANDIDATE_FEATURE_NAMES = (
+    MARKET_FEATURE_NAMES
+    + TEMPORAL_FEATURE_NAMES
+    + GEMINI_FEATURE_NAMES
+    + MARKET_CONTEXT_FEATURE_NAMES
+    + MACRO_FEATURE_NAMES
+)
 
-BASE_FEATURE_NAMES = MARKET_FEATURE_NAMES + MARKET_CONTEXT_FEATURE_NAMES + SENTIMENT_FEATURE_NAMES
-MODEL_FEATURE_NAMES = BASE_FEATURE_NAMES + TFIDF_FEATURE_NAMES
-EXPECTED_FEATURE_COUNT = len(MODEL_FEATURE_NAMES)
+FEATURE_GROUPS = {
+    "market": MARKET_FEATURE_NAMES,
+    "temporal": TEMPORAL_FEATURE_NAMES,
+    "sentiment": GEMINI_FEATURE_NAMES,
+    "context": MARKET_CONTEXT_FEATURE_NAMES,
+    "macro": MACRO_FEATURE_NAMES,
+}
 
-DEFAULT_SENTIMENT_FEATURES = {
-    "headlines_text": "",
-    "sentiment_score": 0.0,
+FEATURE_GROUP_LABELS = {
+    "market": "Live Market Snapshot",
+    "temporal": "Temporal / Momentum",
+    "sentiment": "Gemini Sentiment",
+    "context": "Market Context",
+    "macro": "Macro / Regime",
+}
+
+DEFAULT_MARKET_FEATURES = {feature_name: 0.0 for feature_name in MARKET_FEATURE_NAMES}
+DEFAULT_TEMPORAL_FEATURES = {feature_name: 0.0 for feature_name in TEMPORAL_FEATURE_NAMES}
+DEFAULT_GEMINI_FEATURES = {
+    "gemini_sentiment_avg": 0.0,
+    "gemini_sentiment_max": 0.0,
+    "gemini_sentiment_min": 0.0,
+    "gemini_magnitude_avg": 0.0,
     "headline_count": 0,
-    "has_news": 0,
-    "avg_news_age_hours": float(NEWS_LOOKBACK_DAYS * 24),
-    "news_source_count": 0,
+    "has_earnings_news": 0,
+    "has_analyst_news": 0,
+    "sentiment_dispersion": 0.0,
+    "sentiment_market_alignment": 0,
 }
 
 DEFAULT_MARKET_CONTEXT_FEATURES = {
@@ -81,78 +140,178 @@ DEFAULT_MARKET_CONTEXT_FEATURES = {
     "vix_change_pct": 0.0,
 }
 
-FEATURE_GROUPS = {
-    "market": MARKET_FEATURE_NAMES,
-    "context": MARKET_CONTEXT_FEATURE_NAMES,
-    "sentiment": SENTIMENT_FEATURE_NAMES,
-    "text_vector": TFIDF_FEATURE_NAMES,
+DEFAULT_MACRO_FEATURES = {
+    "yield_curve_spread": 0.0,
+    "fed_funds_rate": 0.0,
+    "fed_funds_change_3m": 0.0,
+    "credit_spread": 0.0,
+    "dxy_change_5d": 0.0,
+    "universe_breadth_50d": 0.0,
 }
 
-FEATURE_GROUP_LABELS = {
-    "market": "Live Market Snapshot",
-    "context": "Market Context",
-    "sentiment": "News Sentiment",
-    "text_vector": "Headline Vector",
-}
-
-FEATURE_LABELS = {
-    "current_price": "Current Price",
-    "previous_close": "Previous Close",
-    "day_open": "Open",
-    "day_high": "Day High",
-    "day_low": "Day Low",
-    "day_change": "Day Change",
-    "day_change_pct": "Day Change %",
-    "gap_pct": "Open Gap %",
-    "intraday_range_pct": "Intraday Range %",
-    "close_vs_open_pct": "Close vs Open %",
-    "day_range_position": "Day Range Position",
-    "volume": "Volume",
-    "avg_volume_10d": "Avg Volume 10D",
-    "avg_volume_3m": "Avg Volume 3M",
-    "volume_vs_avg_10d": "Volume vs Avg 10D",
-    "volume_vs_avg_3m": "Volume vs Avg 3M",
-    "fifty_day_avg": "50D Average",
-    "two_hundred_day_avg": "200D Average",
-    "price_vs_50d_avg": "Price vs 50D Avg",
-    "price_vs_200d_avg": "Price vs 200D Avg",
-    "fifty_two_week_high": "52W High",
-    "fifty_two_week_low": "52W Low",
-    "price_vs_52w_high": "Price vs 52W High",
-    "price_vs_52w_low": "Price vs 52W Low",
-    "position_52w_range": "52W Range Position",
-    "spy_change_pct": "SPY Change %",
-    "spy_gap_pct": "SPY Gap %",
-    "vix_level": "VIX Level",
-    "vix_change_pct": "VIX Change %",
-    "sentiment_score": "Sentiment Score",
-    "headline_count": "Headline Count",
-    "has_news": "Has News",
-    "avg_news_age_hours": "Avg News Age (Hours)",
-    "news_source_count": "News Source Count",
+DEFAULT_CANDIDATE_FEATURES = {
+    **DEFAULT_MARKET_FEATURES,
+    **DEFAULT_TEMPORAL_FEATURES,
+    **DEFAULT_GEMINI_FEATURES,
+    **DEFAULT_MARKET_CONTEXT_FEATURES,
+    **DEFAULT_MACRO_FEATURES,
 }
 
 
-def _replace_zero(values: pd.Series | float | int | None):
+@dataclass(frozen=True)
+class FeatureSpec:
+    name: str
+    group: str
+    default_value: float | int
+    online_servable: bool = True
+
+
+FEATURE_SPECS = tuple(
+    [FeatureSpec(name, "market", DEFAULT_MARKET_FEATURES[name]) for name in MARKET_FEATURE_NAMES]
+    + [FeatureSpec(name, "temporal", DEFAULT_TEMPORAL_FEATURES[name]) for name in TEMPORAL_FEATURE_NAMES]
+    + [FeatureSpec(name, "sentiment", DEFAULT_GEMINI_FEATURES[name]) for name in GEMINI_FEATURE_NAMES]
+    + [FeatureSpec(name, "context", DEFAULT_MARKET_CONTEXT_FEATURES[name]) for name in MARKET_CONTEXT_FEATURE_NAMES]
+    + [FeatureSpec(name, "macro", DEFAULT_MACRO_FEATURES[name]) for name in MACRO_FEATURE_NAMES]
+)
+FEATURE_SPECS_BY_NAME = {spec.name: spec for spec in FEATURE_SPECS}
+ONLINE_SERVABLE_FEATURE_NAMES = [spec.name for spec in FEATURE_SPECS if spec.online_servable]
+
+def build_temporary_selected_feature_contract(feature_count: int = TEMPORARY_SELECTED_FEATURE_COUNT) -> dict:
+    resolved_feature_count = max(len(GEMINI_FEATURE_NAMES), min(feature_count, len(CANDIDATE_FEATURE_NAMES)))
+    remaining_feature_names = [name for name in CANDIDATE_FEATURE_NAMES if name not in GEMINI_FEATURE_NAMES]
+    seed_material = f"{CANDIDATE_FEATURE_VERSION}:{resolved_feature_count}"
+    seed = int(hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:8], 16)
+    shuffled_feature_names = list(remaining_feature_names)
+    random.Random(seed).shuffle(shuffled_feature_names)
+    selected_feature_names = list(GEMINI_FEATURE_NAMES) + shuffled_feature_names[
+        : resolved_feature_count - len(GEMINI_FEATURE_NAMES)
+    ]
+
+    return {
+        "run_id": f"temporary-{CANDIDATE_FEATURE_VERSION}-random-{resolved_feature_count}",
+        "candidate_feature_version": CANDIDATE_FEATURE_VERSION,
+        "candidate_feature_count": len(CANDIDATE_FEATURE_NAMES),
+        "selected_feature_names": selected_feature_names,
+        "selected_feature_count": len(selected_feature_names),
+        "selection_source": TEMPORARY_FEATURE_SELECTION_SOURCE,
+        "feature_selection_mode": TEMPORARY_FEATURE_SELECTION_MODE,
+        "feature_selection_seed": seed_material,
+        "generated_at": None,
+        "review_status": "TEMPORARY_FALLBACK",
+        "execution_status": "WAITING_FOR_AUTOML",
+        "notes": (
+            "Temporary deterministic 40-feature subset while the Vertex AutoML feature "
+            "ranking contract is still pending. All Gemini news-text features are retained."
+        ),
+        "is_temporary": True,
+    }
+
+
+_DEFAULT_SELECTED_FEATURE_CONTRACT = build_temporary_selected_feature_contract()
+
+_SELECTED_FEATURES_PATH = Path(__file__).with_name("selected_features.json")
+
+
+def _load_selected_feature_contract() -> dict:
+    default_contract = build_temporary_selected_feature_contract()
+    if not _SELECTED_FEATURES_PATH.exists():
+        return default_contract
+
+    try:
+        payload = json.loads(_SELECTED_FEATURES_PATH.read_text())
+    except Exception as exc:
+        log.warning("Failed to read selected feature contract from %s: %s", _SELECTED_FEATURES_PATH, exc)
+        return default_contract
+
+    feature_names = [
+        str(name)
+        for name in (payload.get("selected_feature_names") or [])
+        if str(name) in CANDIDATE_FEATURE_NAMES
+    ]
+    if not feature_names:
+        return default_contract
+
+    contract = {
+        **default_contract,
+        **payload,
+        "selected_feature_names": feature_names,
+        "selected_feature_count": int(payload.get("selected_feature_count") or len(feature_names)),
+    }
+    contract["is_temporary"] = bool(payload.get("is_temporary")) or (
+        contract.get("selection_source") == TEMPORARY_FEATURE_SELECTION_SOURCE
+    )
+    if contract["is_temporary"] and "feature_selection_mode" not in payload:
+        contract["feature_selection_mode"] = TEMPORARY_FEATURE_SELECTION_MODE
+    return contract
+
+
+SELECTED_FEATURE_CONTRACT = _load_selected_feature_contract()
+MODEL_FEATURE_NAMES = list(SELECTED_FEATURE_CONTRACT["selected_feature_names"])
+EXPECTED_FEATURE_COUNT = len(MODEL_FEATURE_NAMES)
+
+def get_selected_feature_contract() -> dict:
+    return dict(SELECTED_FEATURE_CONTRACT)
+
+
+def candidate_feature_version() -> str:
+    return CANDIDATE_FEATURE_VERSION
+
+
+def _replace_zero(values: pd.Series | np.ndarray | float | int | None):
     if isinstance(values, pd.Series):
         return values.replace(0, np.nan)
+    if isinstance(values, np.ndarray):
+        out = np.asarray(values, dtype=float).copy()
+        out[out == 0] = np.nan
+        return out
     if values in (0, 0.0):
         return np.nan
     return values
 
 
-def _as_python(value):
-    if isinstance(value, (np.generic,)):
-        value = value.item()
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-    if pd.isna(value):
+def _safe_divide(numerator, denominator):
+    if isinstance(denominator, pd.Series):
+        denominator = _replace_zero(denominator)
+    elif isinstance(denominator, np.ndarray):
+        denominator = _replace_zero(denominator)
+    elif denominator in (0, 0.0):
+        denominator = np.nan
+    return numerator / denominator
+
+
+def is_missing_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return is_missing_value(value.item())
+        return False
+    if isinstance(value, (list, tuple, dict, set, pd.Series, pd.DataFrame, pd.Index)):
+        return False
+    try:
+        missing = pd.isna(value)
+    except Exception:
+        return False
+    if isinstance(missing, (np.ndarray, pd.Series, pd.DataFrame, pd.Index, list, tuple)):
+        return False
+    return bool(missing)
+
+
+def coerce_scalarlike(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return coerce_scalarlike(value.item())
+        if value.size == 1:
+            return coerce_scalarlike(value.reshape(-1)[0])
         return None
+    if isinstance(value, np.generic):
+        return value.item()
     return value
 
 
 def _safe_float(value: object, default: float | None = None) -> float | None:
-    if value is None or pd.isna(value):
+    value = coerce_scalarlike(value)
+    if is_missing_value(value):
         return default
     try:
         numeric = float(value)
@@ -163,12 +322,124 @@ def _safe_float(value: object, default: float | None = None) -> float | None:
     return numeric
 
 
-def _safe_divide(numerator, denominator):
-    if isinstance(denominator, pd.Series):
-        denominator = _replace_zero(denominator)
-    elif denominator in (0, 0.0):
-        denominator = np.nan
-    return numerator / denominator
+def _safe_int(value: object, default: int = 0) -> int:
+    numeric = _safe_float(value)
+    if numeric is None:
+        return default
+    return int(round(numeric))
+
+
+def _safe_is_zero(x: object) -> bool:
+    """Return True if x is scalar zero. Safe for numpy arrays (avoids ambiguous truth value)."""
+    s = coerce_scalarlike(x)
+    if s is None:
+        return False
+    try:
+        return float(s) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _safe_scalar_equals(a: object, b: object) -> bool:
+    """Return True if a and b coerce to the same scalar. Safe for numpy arrays."""
+    sa, sb = coerce_scalarlike(a), coerce_scalarlike(b)
+    if sa is None or sb is None:
+        return False
+    try:
+        return float(sa) == float(sb)
+    except (TypeError, ValueError):
+        return False
+
+
+def _as_python(value: Any) -> Any:
+    value = coerce_scalarlike(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if is_missing_value(value):
+        return None
+    return value
+
+
+def get_feature_spec(feature_name: str) -> FeatureSpec:
+    spec = FEATURE_SPECS_BY_NAME.get(str(feature_name))
+    if spec is None:
+        raise KeyError(f"Unknown feature '{feature_name}'.")
+    return spec
+
+
+def feature_default_values(feature_names: Sequence[str] | None = None) -> dict[str, float | int]:
+    names = list(feature_names or CANDIDATE_FEATURE_NAMES)
+    return {name: get_feature_spec(name).default_value for name in names}
+
+
+def validate_online_feature_names(feature_names: Sequence[str]) -> list[str]:
+    invalid = [name for name in feature_names if name not in FEATURE_SPECS_BY_NAME]
+    if invalid:
+        raise ValueError(f"Unknown feature names in contract: {invalid}")
+    unsupported = [name for name in feature_names if name not in ONLINE_SERVABLE_FEATURE_NAMES]
+    if unsupported:
+        raise ValueError(
+            "Selected feature contract includes features that are not supported by the shared online feature builder: "
+            f"{unsupported}"
+        )
+    return list(feature_names)
+
+
+def _coerce_feature_group_frame(
+    payload: pd.DataFrame | Mapping[str, object] | None,
+    *,
+    feature_names: Sequence[str],
+    row_count: int,
+) -> pd.DataFrame:
+    if payload is None:
+        frame = pd.DataFrame(index=range(row_count))
+    elif isinstance(payload, pd.DataFrame):
+        frame = payload.copy().reset_index(drop=True)
+    elif isinstance(payload, Mapping):
+        frame = pd.DataFrame([dict(payload)]).reset_index(drop=True)
+    else:
+        raise TypeError(f"Unsupported feature payload type: {type(payload)!r}")
+
+    if len(frame) not in (0, row_count):
+        raise ValueError(
+            f"Feature payload row count mismatch. Expected {row_count} rows, received {len(frame)} rows."
+        )
+    if len(frame) == 0 and row_count:
+        frame = pd.DataFrame(index=range(row_count))
+    for feature_name in feature_names:
+        if feature_name not in frame.columns:
+            frame[feature_name] = get_feature_spec(feature_name).default_value
+    return frame[list(feature_names)].reset_index(drop=True)
+
+
+def build_candidate_feature_frame(
+    *,
+    market_features: pd.DataFrame | Mapping[str, object] | None = None,
+    temporal_features: pd.DataFrame | Mapping[str, object] | None = None,
+    sentiment_features: pd.DataFrame | Mapping[str, object] | None = None,
+    context_features: pd.DataFrame | Mapping[str, object] | None = None,
+    macro_features: pd.DataFrame | Mapping[str, object] | None = None,
+    row_count: int | None = None,
+) -> pd.DataFrame:
+    resolved_row_count = row_count
+    for payload in (market_features, temporal_features, sentiment_features, context_features, macro_features):
+        if resolved_row_count is not None:
+            break
+        if isinstance(payload, pd.DataFrame):
+            resolved_row_count = len(payload)
+        elif isinstance(payload, Mapping):
+            resolved_row_count = 1
+    resolved_row_count = 1 if resolved_row_count is None else int(resolved_row_count)
+
+    frames = [
+        _coerce_feature_group_frame(market_features, feature_names=MARKET_FEATURE_NAMES, row_count=resolved_row_count),
+        _coerce_feature_group_frame(temporal_features, feature_names=TEMPORAL_FEATURE_NAMES, row_count=resolved_row_count),
+        _coerce_feature_group_frame(sentiment_features, feature_names=GEMINI_FEATURE_NAMES, row_count=resolved_row_count),
+        _coerce_feature_group_frame(context_features, feature_names=MARKET_CONTEXT_FEATURE_NAMES, row_count=resolved_row_count),
+        _coerce_feature_group_frame(macro_features, feature_names=MACRO_FEATURE_NAMES, row_count=resolved_row_count),
+    ]
+    candidate_df = pd.concat(frames, axis=1)
+    return candidate_df.reindex(columns=CANDIDATE_FEATURE_NAMES).replace([np.inf, -np.inf], np.nan)
 
 
 def normalize_headlines(headlines: Sequence[str] | str | None) -> list[str]:
@@ -206,85 +477,62 @@ def extract_news_title(item: Mapping[str, object] | None) -> str | None:
     return None
 
 
-@lru_cache(maxsize=1)
-def get_sentiment_analyzer():
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+def normalize_live_news_items(news_items: Sequence[Mapping[str, object]] | None) -> list[dict]:
+    seen: set[tuple[str, str]] = set()
+    normalized: list[dict] = []
+    for item in news_items or []:
+        headline = extract_news_title(item)
+        if not headline:
+            continue
 
-    return SentimentIntensityAnalyzer()
+        url = str(item.get("url") or "").strip()
+        dedupe_key = (headline.lower(), url)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        published_at = pd.to_datetime(
+            item.get("published_at") or item.get("datetime") or item.get("providerPublishTime"),
+            errors="coerce",
+            utc=True,
+        )
+        normalized.append(
+            {
+                "headline": headline,
+                "source": str(item.get("source") or item.get("provider_name") or item.get("provider") or "").strip(),
+                "provider": str(item.get("provider") or "unknown").strip() or "unknown",
+                "url": url or None,
+                "published_at": None if pd.isna(published_at) else published_at.isoformat(),
+            }
+        )
+
+    normalized.sort(key=lambda row: row["published_at"] or "", reverse=True)
+    return normalized
 
 
-def compute_headline_features(
-    headlines: Sequence[str] | str | None,
+def require_live_news_items(
+    news_items: Sequence[Mapping[str, object]] | None,
     *,
-    timestamps: Sequence[object] | None = None,
-    sources: Sequence[str] | None = None,
-    reference_time: object | None = None,
-) -> dict:
-    normalized = normalize_headlines(headlines)
-    if not normalized:
-        return DEFAULT_SENTIMENT_FEATURES.copy()
+    ticker: str | None = None,
+) -> list[dict]:
+    normalized = normalize_live_news_items(news_items)
+    live_news_items = [
+        item for item in normalized if str(item.get("provider") or "").strip().lower() in LIVE_NEWS_PROVIDERS
+    ]
+    if live_news_items:
+        return normalized
 
-    analyzer = get_sentiment_analyzer()
-    scores = [analyzer.polarity_scores(headline)["compound"] for headline in normalized]
-
-    source_count = len(
-        {
-            str(source).strip()
-            for source in (sources or [])
-            if isinstance(source, str) and source.strip()
-        }
+    ticker_label = f" for {ticker.strip().upper()}" if isinstance(ticker, str) and ticker.strip() else ""
+    raise ValueError(
+        f"Live news is required for inference{ticker_label}. No live news items were available from Finnhub or Yahoo."
     )
 
-    avg_age_hours = DEFAULT_SENTIMENT_FEATURES["avg_news_age_hours"]
-    if timestamps:
-        normalized_timestamps = pd.to_datetime(pd.Series(list(timestamps)), errors="coerce", utc=True)
-        normalized_timestamps = normalized_timestamps.dropna()
-        if not normalized_timestamps.empty:
-            anchor = pd.Timestamp(reference_time or pd.Timestamp.utcnow())
-            if anchor.tzinfo is None:
-                anchor = anchor.tz_localize("UTC")
-            else:
-                anchor = anchor.tz_convert("UTC")
-            ages = (anchor - normalized_timestamps).dt.total_seconds().clip(lower=0) / 3600.0
-            if not ages.empty:
-                avg_age_hours = float(ages.mean())
 
-    return {
-        "headlines_text": " ".join(normalized),
-        "sentiment_score": round(float(np.mean(scores)), 6),
-        "headline_count": len(normalized),
-        "has_news": 1,
-        "avg_news_age_hours": round(float(avg_age_hours), 6),
-        "news_source_count": source_count,
-    }
-
-
-def _tfidf_frame(matrix, index: pd.Index) -> pd.DataFrame:
-    frame = pd.DataFrame(
-        matrix.toarray(),
-        columns=[f"tfidf_{idx}" for idx in range(matrix.shape[1])],
-        index=index,
-    )
-    return frame.reindex(columns=TFIDF_FEATURE_NAMES, fill_value=0.0)
-
-
-def fit_tfidf_safely(texts: pd.Series) -> tuple[TfidfVectorizer, pd.DataFrame]:
-    cleaned = texts.fillna("").astype(str)
-    vectorizer = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, ngram_range=(1, 2))
-
-    if cleaned.str.strip().eq("").all():
-        vectorizer.fit(["__no_headlines__"])
-        matrix = vectorizer.transform([""] * len(cleaned))
-        return vectorizer, _tfidf_frame(matrix, cleaned.index)
-
-    matrix = vectorizer.fit_transform(cleaned)
-    return vectorizer, _tfidf_frame(matrix, cleaned.index)
-
-
-def transform_tfidf_frame(vectorizer: TfidfVectorizer, texts: pd.Series) -> pd.DataFrame:
-    cleaned = texts.fillna("").astype(str)
-    matrix = vectorizer.transform(cleaned)
-    return _tfidf_frame(matrix, cleaned.index)
+def extract_live_news_sentiment_items(sentiment_features: Mapping[str, object]) -> list[dict]:
+    candidate_items = sentiment_features.get(LIVE_NEWS_SENTIMENT_ITEMS_KEY)
+    if not isinstance(candidate_items, Sequence) or isinstance(candidate_items, (str, bytes)):
+        return []
+    return [dict(item) for item in candidate_items if isinstance(item, Mapping)]
 
 
 def prepare_price_history_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -314,7 +562,7 @@ def prepare_price_history_frame(df: pd.DataFrame) -> pd.DataFrame:
     if getattr(working["date"].dt, "tz", None) is not None:
         working["date"] = working["date"].dt.tz_convert(None)
     working["date"] = working["date"].astype("datetime64[ns]")
-    return working.dropna(subset=["date"]).sort_values("date")
+    return working.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
 
 def compute_market_features_from_history(df: pd.DataFrame) -> pd.DataFrame:
@@ -339,22 +587,22 @@ def compute_market_features_from_history(df: pd.DataFrame) -> pd.DataFrame:
     features["day_range_position"] = _safe_divide(close - low, high - low)
     features["volume"] = volume
 
-    avg_volume_10d = volume.rolling(10, min_periods=3).mean()
-    avg_volume_3m = volume.rolling(63, min_periods=10).mean()
+    avg_volume_10d = volume.rolling(10, min_periods=10).mean()
+    avg_volume_3m = volume.rolling(63, min_periods=20).mean()
     features["avg_volume_10d"] = avg_volume_10d
     features["avg_volume_3m"] = avg_volume_3m
     features["volume_vs_avg_10d"] = _safe_divide(volume, avg_volume_10d)
     features["volume_vs_avg_3m"] = _safe_divide(volume, avg_volume_3m)
 
-    fifty_day_avg = close.rolling(50, min_periods=10).mean()
-    two_hundred_day_avg = close.rolling(200, min_periods=30).mean()
+    fifty_day_avg = close.rolling(50, min_periods=50).mean()
+    two_hundred_day_avg = close.rolling(200, min_periods=200).mean()
     features["fifty_day_avg"] = fifty_day_avg
     features["two_hundred_day_avg"] = two_hundred_day_avg
     features["price_vs_50d_avg"] = _safe_divide(close, fifty_day_avg) - 1
     features["price_vs_200d_avg"] = _safe_divide(close, two_hundred_day_avg) - 1
 
-    fifty_two_week_high = high.rolling(252, min_periods=30).max()
-    fifty_two_week_low = low.rolling(252, min_periods=30).min()
+    fifty_two_week_high = high.rolling(252, min_periods=252).max()
+    fifty_two_week_low = low.rolling(252, min_periods=252).min()
     features["fifty_two_week_high"] = fifty_two_week_high
     features["fifty_two_week_low"] = fifty_two_week_low
     features["price_vs_52w_high"] = _safe_divide(close, fifty_two_week_high) - 1
@@ -362,6 +610,75 @@ def compute_market_features_from_history(df: pd.DataFrame) -> pd.DataFrame:
     features["position_52w_range"] = _safe_divide(close - fifty_two_week_low, fifty_two_week_high - fifty_two_week_low)
 
     return features[MARKET_FEATURE_NAMES].replace([np.inf, -np.inf], np.nan)
+
+
+def _rolling_slope(series: pd.Series) -> float:
+    values = series.astype(float).to_numpy()
+    if len(values) < 2 or np.isnan(values).any():
+        return np.nan
+    x = np.arange(len(values), dtype=float)
+    slope = np.polyfit(x, values, 1)[0]
+    baseline = np.nanmean(np.abs(values)) or 1.0
+    return float(slope / baseline)
+
+
+def _momentum_streak(returns: pd.Series) -> pd.Series:
+    streaks: list[int] = []
+    running = 0
+    for value in returns.fillna(0.0):
+        if value > 0:
+            running = running + 1 if running >= 0 else 1
+        elif value < 0:
+            running = running - 1 if running <= 0 else -1
+        else:
+            running = 0
+        streaks.append(running)
+    return pd.Series(streaks, index=returns.index, dtype=float)
+
+
+def compute_temporal_features_from_history(
+    df: pd.DataFrame,
+    *,
+    spy_return_5d: pd.Series | None = None,
+) -> pd.DataFrame:
+    close = df["Close"].astype(float)
+    volume = df["Volume"].astype(float)
+    daily_ret = close.pct_change()
+
+    features = pd.DataFrame(index=df.index)
+    features["return_1d"] = close.pct_change(1)
+    features["return_3d"] = close.pct_change(3)
+    features["return_5d"] = close.pct_change(5)
+    features["return_10d"] = close.pct_change(10)
+    features["return_20d"] = close.pct_change(20)
+    features["momentum_streak"] = _momentum_streak(daily_ret)
+    rolling_vol_5d = daily_ret.rolling(5, min_periods=5).std()
+    rolling_vol_20d = daily_ret.rolling(20, min_periods=20).std()
+    features["volatility_regime"] = _safe_divide(rolling_vol_5d, rolling_vol_20d)
+    features["volume_trend_5d"] = volume.rolling(5, min_periods=5).apply(_rolling_slope, raw=False)
+    features["price_acceleration"] = features["return_5d"] - features["return_10d"]
+
+    if spy_return_5d is None:
+        features["relative_strength_spy"] = np.nan
+    else:
+        aligned_spy = spy_return_5d.reindex(df.index)
+        features["relative_strength_spy"] = features["return_5d"] - aligned_spy
+
+    return features[TEMPORAL_FEATURE_NAMES].replace([np.inf, -np.inf], np.nan)
+
+
+def build_market_temporal_feature_frame_from_history(
+    df: pd.DataFrame,
+    *,
+    spy_return_5d: pd.Series | None = None,
+) -> pd.DataFrame:
+    market_features = compute_market_features_from_history(df)
+    temporal_features = compute_temporal_features_from_history(df, spy_return_5d=spy_return_5d)
+    return build_candidate_feature_frame(
+        market_features=market_features,
+        temporal_features=temporal_features,
+        row_count=len(df.index),
+    )[MARKET_FEATURE_NAMES + TEMPORAL_FEATURE_NAMES]
 
 
 def build_market_context_history(spy_history: pd.DataFrame, vix_history: pd.DataFrame) -> pd.DataFrame:
@@ -407,12 +724,7 @@ def build_market_context_feature_frame(
         date_series = date_series.dt.tz_convert(None)
     date_series = date_series.dt.normalize().astype("datetime64[ns]")
 
-    frame = pd.DataFrame(
-        {
-            "date": date_series,
-            "_row_id": np.arange(len(date_series)),
-        }
-    )
+    frame = pd.DataFrame({"date": date_series, "_row_id": np.arange(len(date_series))})
     for column, default_value in DEFAULT_MARKET_CONTEXT_FEATURES.items():
         frame[column] = default_value
 
@@ -422,9 +734,6 @@ def build_market_context_feature_frame(
         if getattr(context["date"].dt, "tz", None) is not None:
             context["date"] = context["date"].dt.tz_convert(None)
         context["date"] = context["date"].dt.normalize().astype("datetime64[ns]")
-        for column, default_value in DEFAULT_MARKET_CONTEXT_FEATURES.items():
-            if column not in context.columns:
-                context[column] = default_value
 
         valid = frame[frame["date"].notna()].sort_values("date")
         if not valid.empty:
@@ -441,160 +750,77 @@ def build_market_context_feature_frame(
     return frame.sort_values("_row_id")[MARKET_CONTEXT_FEATURE_NAMES].reset_index(drop=True)
 
 
-def build_training_news_feature_table(
-    news_df: pd.DataFrame,
-    market_dates_df: pd.DataFrame,
-    *,
-    lookback_days: int = NEWS_LOOKBACK_DAYS,
+def align_model_features(
+    feature_df: pd.DataFrame,
+    feature_names: Sequence[str] | None = None,
 ) -> pd.DataFrame:
-    targets = market_dates_df[["ticker", "date"]].drop_duplicates().copy()
-    targets["date"] = pd.to_datetime(targets["date"]).dt.normalize()
+    expected = list(feature_names or MODEL_FEATURE_NAMES)
+    missing_columns = [column for column in expected if column not in feature_df.columns]
+    if missing_columns:
+        raise AssertionError(f"Missing required feature columns: {missing_columns}")
 
-    if targets.empty:
-        return pd.DataFrame(columns=["ticker", "date", *DEFAULT_SENTIMENT_FEATURES.keys()])
-
-    if news_df.empty:
-        defaults = pd.DataFrame([DEFAULT_SENTIMENT_FEATURES] * len(targets))
-        return pd.concat([targets.reset_index(drop=True), defaults], axis=1)
-
-    working = news_df.copy()
-    working["date"] = pd.to_datetime(working["date"]).dt.normalize()
-    if "timestamp" in working.columns:
-        working["timestamp"] = pd.to_datetime(working["timestamp"], errors="coerce", utc=True)
-    else:
-        working["timestamp"] = pd.to_datetime(working["date"], errors="coerce", utc=True) + pd.Timedelta(hours=16)
-    working["headline"] = working["headline"].fillna("").astype(str)
-    working["source"] = working.get("source", "").fillna("").astype(str)
-    working = working[working["headline"].str.strip().ne("")].copy()
-
-    news_lookup = {
-        ticker: group.sort_values("timestamp").reset_index(drop=True)
-        for ticker, group in working.groupby("ticker", sort=False)
-    }
-
-    rows: list[dict] = []
-    for ticker, group in targets.sort_values(["ticker", "date"]).groupby("ticker", sort=False):
-        ticker_news = news_lookup.get(ticker, pd.DataFrame(columns=working.columns))
-        for current_date in group["date"]:
-            reference_time = pd.Timestamp(current_date).tz_localize("UTC") + pd.Timedelta(hours=16)
-            window_start = pd.Timestamp(current_date) - pd.Timedelta(days=lookback_days - 1)
-            if ticker_news.empty:
-                features = DEFAULT_SENTIMENT_FEATURES.copy()
-            else:
-                window = ticker_news[
-                    (ticker_news["date"] >= window_start)
-                    & (ticker_news["date"] <= current_date)
-                ]
-                features = compute_headline_features(
-                    window["headline"].tolist(),
-                    timestamps=window["timestamp"].tolist(),
-                    sources=window["source"].tolist(),
-                    reference_time=reference_time,
-                )
-            rows.append({"ticker": ticker, "date": current_date, **features})
-
-    return pd.DataFrame(rows)
+    aligned = feature_df.reindex(columns=expected).copy()
+    aligned = aligned.replace([np.inf, -np.inf], np.nan)
+    if aligned.isna().any().any():
+        missing = aligned.columns[aligned.isna().any()].tolist()
+        raise AssertionError(f"Required features contain null values: {missing}")
+    return aligned
 
 
 def _trace_value(trace: Mapping[str, object] | None, default: float = 0.0) -> float:
     if not isinstance(trace, Mapping):
         return default
-    return _safe_float(trace.get("value"), default) or default
+    value = _safe_float(trace.get("value"), default)
+    return default if value is None else value
 
 
-def _raw_feature_detail(
+def _titleize_feature_name(name: str) -> str:
+    return name.replace("_", " ").title()
+
+
+def _build_feature_detail(
+    *,
     name: str,
-    value: float,
+    value: Any,
     group: str,
-    trace: Mapping[str, object] | None,
+    source: str,
+    providers: Sequence[str] | None = None,
+    raw_fields: Sequence[str] | None = None,
+    fallback_used: bool = False,
 ) -> dict:
-    trace = dict(trace or {})
-    provider = str(trace.get("provider") or "default")
     return {
         "name": name,
-        "label": FEATURE_LABELS.get(name, name),
+        "label": _titleize_feature_name(name),
         "value": _as_python(value),
         "group": group,
-        "source": provider,
-        "providers": [provider],
-        "raw_fields": [str(trace.get("raw_field") or name)],
-        "fallback_used": bool(trace.get("fallback_used", False)),
+        "source": source,
+        "providers": list(dict.fromkeys(providers or [source])),
+        "raw_fields": list(dict.fromkeys(raw_fields or [name])),
+        "fallback_used": bool(fallback_used),
     }
 
 
-def _derived_feature_detail(
-    name: str,
-    value: float | int,
-    group: str,
-    traces: Sequence[Mapping[str, object] | None],
-) -> dict:
-    providers = [str(trace.get("provider")) for trace in traces if isinstance(trace, Mapping) and trace.get("provider")]
-    raw_fields = [str(trace.get("raw_field")) for trace in traces if isinstance(trace, Mapping) and trace.get("raw_field")]
-    return {
-        "name": name,
-        "label": FEATURE_LABELS.get(name, name),
-        "value": _as_python(value),
-        "group": group,
-        "source": "derived",
-        "providers": sorted(set(providers)) or ["derived"],
-        "raw_fields": raw_fields or [name],
-        "fallback_used": any(bool(trace.get("fallback_used", False)) for trace in traces if isinstance(trace, Mapping)),
-    }
+def _normalize_history_rows(rows: Sequence[Mapping[str, object]] | pd.DataFrame | None) -> pd.DataFrame:
+    if isinstance(rows, pd.DataFrame):
+        return prepare_price_history_frame(rows)
+    if not rows:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    return prepare_price_history_frame(pd.DataFrame(list(rows)))
 
 
-def normalize_live_news_items(news_items: Sequence[Mapping[str, object]] | None) -> list[dict]:
-    seen: set[tuple[str, str]] = set()
-    normalized: list[dict] = []
-    for item in news_items or []:
-        headline = extract_news_title(item)
-        if not headline:
-            continue
-
-        url = str(item.get("url") or "").strip()
-        key = (headline.lower(), url)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        published_at = pd.to_datetime(
-            item.get("published_at") or item.get("datetime") or item.get("providerPublishTime"),
-            errors="coerce",
-            utc=True,
-        )
-        normalized.append(
-            {
-                "headline": headline,
-                "source": str(item.get("source") or item.get("provider_name") or item.get("provider") or "").strip(),
-                "provider": str(item.get("provider") or "").strip() or "unknown",
-                "url": url,
-                "published_at": None if pd.isna(published_at) else published_at.isoformat(),
-            }
-        )
-
-    normalized.sort(key=lambda row: row["published_at"] or "", reverse=True)
-    return normalized
-
-
-def build_live_feature_bundle(
+def _compute_live_candidate_features(
     live_snapshot: Mapping[str, object],
-    tfidf_vectorizer,
-    feature_names: Sequence[str] | None = None,
-) -> tuple[pd.DataFrame, dict]:
+    *,
+    sentiment_features: Mapping[str, object],
+    macro_features: Mapping[str, object],
+) -> tuple[dict[str, float | int], dict[str, dict]]:
     quote = dict(live_snapshot.get("quote") or {})
     context_payload = dict(live_snapshot.get("market_context") or {})
-    company_name = live_snapshot.get("company_name")
-    company_name = company_name.strip() if isinstance(company_name, str) else None
-    quote_currency = live_snapshot.get("quote_currency")
-    quote_currency = quote_currency.strip().upper() if isinstance(quote_currency, str) else None
-    as_of = pd.Timestamp(live_snapshot.get("as_of") or pd.Timestamp.utcnow())
-    if as_of.tzinfo is None:
-        as_of = as_of.tz_localize("UTC")
-    else:
-        as_of = as_of.tz_convert("UTC")
 
-    market_values: dict[str, float] = {}
-    market_details: list[dict] = []
-    raw_market_traces = {
+    feature_sources: dict[str, dict] = {}
+    candidate_values: dict[str, float | int] = {}
+
+    raw_market_fields = {
         "current_price": quote.get("current_price"),
         "previous_close": quote.get("previous_close"),
         "day_open": quote.get("day_open"),
@@ -609,20 +835,20 @@ def build_live_feature_bundle(
         "fifty_two_week_low": quote.get("fifty_two_week_low"),
     }
 
-    current_price = _trace_value(raw_market_traces["current_price"])
-    previous_close = _trace_value(raw_market_traces["previous_close"])
-    day_open = _trace_value(raw_market_traces["day_open"])
-    day_high = _trace_value(raw_market_traces["day_high"])
-    day_low = _trace_value(raw_market_traces["day_low"])
-    volume = _trace_value(raw_market_traces["volume"])
-    avg_volume_10d = _trace_value(raw_market_traces["avg_volume_10d"])
-    avg_volume_3m = _trace_value(raw_market_traces["avg_volume_3m"])
-    fifty_day_avg = _trace_value(raw_market_traces["fifty_day_avg"])
-    two_hundred_day_avg = _trace_value(raw_market_traces["two_hundred_day_avg"])
-    fifty_two_week_high = _trace_value(raw_market_traces["fifty_two_week_high"])
-    fifty_two_week_low = _trace_value(raw_market_traces["fifty_two_week_low"])
+    current_price = _trace_value(raw_market_fields["current_price"])
+    previous_close = _trace_value(raw_market_fields["previous_close"])
+    day_open = _trace_value(raw_market_fields["day_open"])
+    day_high = _trace_value(raw_market_fields["day_high"])
+    day_low = _trace_value(raw_market_fields["day_low"])
+    volume = _trace_value(raw_market_fields["volume"])
+    avg_volume_10d = _trace_value(raw_market_fields["avg_volume_10d"])
+    avg_volume_3m = _trace_value(raw_market_fields["avg_volume_3m"])
+    fifty_day_avg = _trace_value(raw_market_fields["fifty_day_avg"])
+    two_hundred_day_avg = _trace_value(raw_market_fields["two_hundred_day_avg"])
+    fifty_two_week_high = _trace_value(raw_market_fields["fifty_two_week_high"])
+    fifty_two_week_low = _trace_value(raw_market_fields["fifty_two_week_low"])
 
-    market_values.update(
+    candidate_values.update(
         {
             "current_price": current_price,
             "previous_close": previous_close,
@@ -630,137 +856,63 @@ def build_live_feature_bundle(
             "day_high": day_high,
             "day_low": day_low,
             "day_change": current_price - previous_close,
-            "day_change_pct": 0.0 if previous_close == 0 else current_price / previous_close - 1,
-            "gap_pct": 0.0 if previous_close == 0 else day_open / previous_close - 1,
-            "intraday_range_pct": 0.0 if previous_close == 0 else (day_high - day_low) / previous_close,
-            "close_vs_open_pct": 0.0 if day_open == 0 else current_price / day_open - 1,
-            "day_range_position": 0.0 if day_high == day_low else (current_price - day_low) / (day_high - day_low),
+            "day_change_pct": 0.0 if _safe_is_zero(previous_close) else current_price / previous_close - 1,
+            "gap_pct": 0.0 if _safe_is_zero(previous_close) else day_open / previous_close - 1,
+            "intraday_range_pct": 0.0 if _safe_is_zero(previous_close) else (day_high - day_low) / previous_close,
+            "close_vs_open_pct": 0.0 if _safe_is_zero(day_open) else current_price / day_open - 1,
+            "day_range_position": 0.0 if _safe_scalar_equals(day_high, day_low) else (current_price - day_low) / (day_high - day_low),
             "volume": volume,
             "avg_volume_10d": avg_volume_10d,
             "avg_volume_3m": avg_volume_3m,
-            "volume_vs_avg_10d": 0.0 if avg_volume_10d == 0 else volume / avg_volume_10d,
-            "volume_vs_avg_3m": 0.0 if avg_volume_3m == 0 else volume / avg_volume_3m,
+            "volume_vs_avg_10d": 0.0 if _safe_is_zero(avg_volume_10d) else volume / avg_volume_10d,
+            "volume_vs_avg_3m": 0.0 if _safe_is_zero(avg_volume_3m) else volume / avg_volume_3m,
             "fifty_day_avg": fifty_day_avg,
             "two_hundred_day_avg": two_hundred_day_avg,
-            "price_vs_50d_avg": 0.0 if fifty_day_avg == 0 else current_price / fifty_day_avg - 1,
-            "price_vs_200d_avg": 0.0 if two_hundred_day_avg == 0 else current_price / two_hundred_day_avg - 1,
+            "price_vs_50d_avg": 0.0 if _safe_is_zero(fifty_day_avg) else current_price / fifty_day_avg - 1,
+            "price_vs_200d_avg": 0.0 if _safe_is_zero(two_hundred_day_avg) else current_price / two_hundred_day_avg - 1,
             "fifty_two_week_high": fifty_two_week_high,
             "fifty_two_week_low": fifty_two_week_low,
-            "price_vs_52w_high": 0.0 if fifty_two_week_high == 0 else current_price / fifty_two_week_high - 1,
-            "price_vs_52w_low": 0.0 if fifty_two_week_low == 0 else current_price / fifty_two_week_low - 1,
+            "price_vs_52w_high": 0.0 if _safe_is_zero(fifty_two_week_high) else current_price / fifty_two_week_high - 1,
+            "price_vs_52w_low": 0.0 if _safe_is_zero(fifty_two_week_low) else current_price / fifty_two_week_low - 1,
             "position_52w_range": (
                 0.0
-                if fifty_two_week_high == fifty_two_week_low
+                if _safe_scalar_equals(fifty_two_week_high, fifty_two_week_low)
                 else (current_price - fifty_two_week_low) / (fifty_two_week_high - fifty_two_week_low)
             ),
         }
     )
+    for feature_name, trace in raw_market_fields.items():
+        trace_payload = dict(trace or {})
+        feature_sources[feature_name] = {
+            "source": str(trace_payload.get("provider") or "unknown"),
+            "providers": [str(trace_payload.get("provider") or "unknown")],
+            "raw_fields": [str(trace_payload.get("raw_field") or feature_name)],
+            "fallback_used": bool(trace_payload.get("fallback_used", False)),
+        }
 
-    for name in [
-        "current_price",
-        "previous_close",
-        "day_open",
-        "day_high",
-        "day_low",
-        "volume",
-        "avg_volume_10d",
-        "avg_volume_3m",
-        "fifty_day_avg",
-        "two_hundred_day_avg",
-        "fifty_two_week_high",
-        "fifty_two_week_low",
-    ]:
-        market_details.append(_raw_feature_detail(name, market_values[name], "market", raw_market_traces[name]))
-
-    market_details.extend(
-        [
-            _derived_feature_detail(
-                "day_change",
-                market_values["day_change"],
-                "market",
-                [raw_market_traces["current_price"], raw_market_traces["previous_close"]],
-            ),
-            _derived_feature_detail(
-                "day_change_pct",
-                market_values["day_change_pct"],
-                "market",
-                [raw_market_traces["current_price"], raw_market_traces["previous_close"]],
-            ),
-            _derived_feature_detail(
-                "gap_pct",
-                market_values["gap_pct"],
-                "market",
-                [raw_market_traces["day_open"], raw_market_traces["previous_close"]],
-            ),
-            _derived_feature_detail(
-                "intraday_range_pct",
-                market_values["intraday_range_pct"],
-                "market",
-                [raw_market_traces["day_high"], raw_market_traces["day_low"], raw_market_traces["previous_close"]],
-            ),
-            _derived_feature_detail(
-                "close_vs_open_pct",
-                market_values["close_vs_open_pct"],
-                "market",
-                [raw_market_traces["current_price"], raw_market_traces["day_open"]],
-            ),
-            _derived_feature_detail(
-                "day_range_position",
-                market_values["day_range_position"],
-                "market",
-                [raw_market_traces["current_price"], raw_market_traces["day_high"], raw_market_traces["day_low"]],
-            ),
-            _derived_feature_detail(
-                "volume_vs_avg_10d",
-                market_values["volume_vs_avg_10d"],
-                "market",
-                [raw_market_traces["volume"], raw_market_traces["avg_volume_10d"]],
-            ),
-            _derived_feature_detail(
-                "volume_vs_avg_3m",
-                market_values["volume_vs_avg_3m"],
-                "market",
-                [raw_market_traces["volume"], raw_market_traces["avg_volume_3m"]],
-            ),
-            _derived_feature_detail(
-                "price_vs_50d_avg",
-                market_values["price_vs_50d_avg"],
-                "market",
-                [raw_market_traces["current_price"], raw_market_traces["fifty_day_avg"]],
-            ),
-            _derived_feature_detail(
-                "price_vs_200d_avg",
-                market_values["price_vs_200d_avg"],
-                "market",
-                [raw_market_traces["current_price"], raw_market_traces["two_hundred_day_avg"]],
-            ),
-            _derived_feature_detail(
-                "price_vs_52w_high",
-                market_values["price_vs_52w_high"],
-                "market",
-                [raw_market_traces["current_price"], raw_market_traces["fifty_two_week_high"]],
-            ),
-            _derived_feature_detail(
-                "price_vs_52w_low",
-                market_values["price_vs_52w_low"],
-                "market",
-                [raw_market_traces["current_price"], raw_market_traces["fifty_two_week_low"]],
-            ),
-            _derived_feature_detail(
-                "position_52w_range",
-                market_values["position_52w_range"],
-                "market",
-                [
-                    raw_market_traces["current_price"],
-                    raw_market_traces["fifty_two_week_high"],
-                    raw_market_traces["fifty_two_week_low"],
-                ],
-            ),
-        ]
+    ticker_history = _normalize_history_rows(live_snapshot.get("ticker_history"))
+    spy_history = _normalize_history_rows(live_snapshot.get("spy_history"))
+    if ticker_history.empty:
+        raise RuntimeError("Ticker history is unavailable for temporal feature computation.")
+    ticker_history = ticker_history.set_index("date")
+    ticker_history.columns = [column.capitalize() for column in ticker_history.columns]
+    spy_return_5d = None
+    if not spy_history.empty:
+        spy_history = spy_history.set_index("date")
+        spy_return_5d = spy_history["close"].astype(float).pct_change(5)
+    history_feature_frame = build_market_temporal_feature_frame_from_history(
+        ticker_history,
+        spy_return_5d=spy_return_5d,
     )
-
-    context_values: dict[str, float] = {}
-    context_details: list[dict] = []
+    temporal_features = history_feature_frame[TEMPORAL_FEATURE_NAMES].iloc[-1]
+    for feature_name in TEMPORAL_FEATURE_NAMES:
+        candidate_values[feature_name] = _safe_float(temporal_features.get(feature_name), 0.0) or 0.0
+        feature_sources[feature_name] = {
+            "source": "derived",
+            "providers": ["yahoo"],
+            "raw_fields": ["ticker_history", "spy_history"],
+            "fallback_used": False,
+        }
 
     spy = dict(context_payload.get("spy") or {})
     vix = dict(context_payload.get("vix") or {})
@@ -769,90 +921,116 @@ def build_live_feature_bundle(
     spy_open = _trace_value(spy.get("day_open"))
     vix_current = _trace_value(vix.get("current_price"), DEFAULT_MARKET_CONTEXT_FEATURES["vix_level"])
     vix_previous_close = _trace_value(vix.get("previous_close"))
-
-    context_values.update(
+    candidate_values.update(
         {
-            "spy_change_pct": 0.0 if spy_previous_close == 0 else spy_current / spy_previous_close - 1,
-            "spy_gap_pct": 0.0 if spy_previous_close == 0 else spy_open / spy_previous_close - 1,
-            "vix_level": vix_current or DEFAULT_MARKET_CONTEXT_FEATURES["vix_level"],
-            "vix_change_pct": 0.0 if vix_previous_close == 0 else vix_current / vix_previous_close - 1,
+            "spy_change_pct": 0.0 if _safe_is_zero(spy_previous_close) else spy_current / spy_previous_close - 1,
+            "spy_gap_pct": 0.0 if _safe_is_zero(spy_previous_close) else spy_open / spy_previous_close - 1,
+            "vix_level": vix_current,
+            "vix_change_pct": 0.0 if _safe_is_zero(vix_previous_close) else vix_current / vix_previous_close - 1,
+        }
+    )
+    feature_sources.update(
+        {
+            "spy_change_pct": {"source": "derived", "providers": ["finnhub", "yahoo"], "raw_fields": ["spy.quote"], "fallback_used": False},
+            "spy_gap_pct": {"source": "derived", "providers": ["finnhub", "yahoo"], "raw_fields": ["spy.quote"], "fallback_used": False},
+            "vix_level": {"source": "yahoo", "providers": ["yahoo"], "raw_fields": ["vix.quote"], "fallback_used": False},
+            "vix_change_pct": {"source": "derived", "providers": ["yahoo"], "raw_fields": ["vix.quote"], "fallback_used": False},
         }
     )
 
-    context_details.extend(
-        [
-            _derived_feature_detail(
-                "spy_change_pct",
-                context_values["spy_change_pct"],
-                "context",
-                [spy.get("current_price"), spy.get("previous_close")],
-            ),
-            _derived_feature_detail(
-                "spy_gap_pct",
-                context_values["spy_gap_pct"],
-                "context",
-                [spy.get("day_open"), spy.get("previous_close")],
-            ),
-            _raw_feature_detail("vix_level", context_values["vix_level"], "context", vix.get("current_price")),
-            _derived_feature_detail(
-                "vix_change_pct",
-                context_values["vix_change_pct"],
-                "context",
-                [vix.get("current_price"), vix.get("previous_close")],
-            ),
-        ]
+    normalized_sentiment = {**DEFAULT_GEMINI_FEATURES, **{key: _as_python(value) for key, value in dict(sentiment_features).items()}}
+    day_change_pct = float(candidate_values["day_change_pct"])
+    sentiment_avg = _safe_float(normalized_sentiment.get("gemini_sentiment_avg"), 0.0) or 0.0
+    market_sign = 1 if day_change_pct > 0 else -1 if day_change_pct < 0 else 0
+    sentiment_sign = 1 if sentiment_avg > 0 else -1 if sentiment_avg < 0 else 0
+    normalized_sentiment["sentiment_market_alignment"] = int(market_sign != 0 and sentiment_sign == market_sign)
+    for feature_name in GEMINI_FEATURE_NAMES:
+        default_value = DEFAULT_GEMINI_FEATURES[feature_name]
+        if isinstance(default_value, int):
+            candidate_values[feature_name] = _safe_int(normalized_sentiment.get(feature_name), default_value)
+        else:
+            candidate_values[feature_name] = _safe_float(normalized_sentiment.get(feature_name), float(default_value)) or float(default_value)
+        feature_sources[feature_name] = {
+            "source": "gemini",
+            "providers": ["gemini"],
+            "raw_fields": ["raw_news_data", "gemini-2.5-flash-lite"],
+            "fallback_used": False,
+        }
+
+    normalized_macro = {**DEFAULT_MACRO_FEATURES, **dict(macro_features)}
+    for feature_name in MACRO_FEATURE_NAMES:
+        candidate_values[feature_name] = _safe_float(normalized_macro.get(feature_name), DEFAULT_MACRO_FEATURES[feature_name]) or DEFAULT_MACRO_FEATURES[feature_name]
+        feature_sources[feature_name] = {
+            "source": str((dict(macro_features).get("_sources") or {}).get(feature_name, "fred")),
+            "providers": [str((dict(macro_features).get("_sources") or {}).get(feature_name, "fred"))],
+            "raw_fields": [feature_name],
+            "fallback_used": False,
+        }
+
+    return candidate_values, feature_sources
+
+
+def build_live_feature_bundle(
+    live_snapshot: Mapping[str, object],
+    *,
+    sentiment_features: Mapping[str, object],
+    macro_features: Mapping[str, object],
+    feature_names: Sequence[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    company_name = live_snapshot.get("company_name")
+    company_name = company_name.strip() if isinstance(company_name, str) else None
+    quote_currency = live_snapshot.get("quote_currency")
+    quote_currency = quote_currency.strip().upper() if isinstance(quote_currency, str) else None
+    as_of = pd.Timestamp(live_snapshot.get("as_of") or pd.Timestamp.utcnow())
+    if as_of.tzinfo is None:
+        as_of = as_of.tz_localize("UTC")
+    else:
+        as_of = as_of.tz_convert("UTC")
+
+    candidate_values, feature_sources = _compute_live_candidate_features(
+        live_snapshot,
+        sentiment_features=sentiment_features,
+        macro_features=macro_features,
     )
-
-    normalized_news = normalize_live_news_items(live_snapshot.get("news"))
-    sentiment_features = compute_headline_features(
-        [item["headline"] for item in normalized_news],
-        timestamps=[item["published_at"] for item in normalized_news],
-        sources=[item["source"] or item["provider"] for item in normalized_news],
-        reference_time=as_of,
+    expected_feature_names = list(feature_names or MODEL_FEATURE_NAMES)
+    validate_online_feature_names(expected_feature_names)
+    candidate_df = build_candidate_feature_frame(
+        market_features={name: candidate_values.get(name) for name in MARKET_FEATURE_NAMES},
+        temporal_features={name: candidate_values.get(name) for name in TEMPORAL_FEATURE_NAMES},
+        sentiment_features={name: candidate_values.get(name) for name in GEMINI_FEATURE_NAMES},
+        context_features={name: candidate_values.get(name) for name in MARKET_CONTEXT_FEATURE_NAMES},
+        macro_features={name: candidate_values.get(name) for name in MACRO_FEATURE_NAMES},
+        row_count=1,
     )
-    sentiment_details = [
-        _derived_feature_detail(
-            name,
-            sentiment_features[name],
-            "sentiment",
-            [{"provider": item["provider"], "raw_field": item["source"] or item["provider"]} for item in normalized_news],
-        )
-        for name in SENTIMENT_FEATURE_NAMES
-    ]
+    selected_df = align_model_features(candidate_df, feature_names)
 
-    tfidf_df = transform_tfidf_frame(
-        tfidf_vectorizer,
-        pd.Series([sentiment_features["headlines_text"]]),
-    ).reset_index(drop=True)
-    tfidf_values = tfidf_df.iloc[0].to_dict()
-    tfidf_details = [
-        _derived_feature_detail(
-            name,
-            tfidf_values[name],
-            "text_vector",
-            [{"provider": item["provider"], "raw_field": "news.headline"} for item in normalized_news],
-        )
-        for name in TFIDF_FEATURE_NAMES
-    ]
+    normalized_news = extract_live_news_sentiment_items(sentiment_features)
+    if not normalized_news:
+        normalized_news = normalize_live_news_items(live_snapshot.get("news"))
 
-    combined = {
-        **market_values,
-        **context_values,
-        **{name: sentiment_features[name] for name in SENTIMENT_FEATURE_NAMES},
-        **tfidf_values,
-    }
-    feature_df = align_model_features(pd.DataFrame([combined]), feature_names)
-
-    grouped_details = defaultdict(list)
-    for detail in market_details + context_details + sentiment_details + tfidf_details:
-        grouped_details[detail["group"]].append(detail)
+    grouped_details: dict[str, list[dict]] = defaultdict(list)
+    for group_key, feature_names_in_group in FEATURE_GROUPS.items():
+        for feature_name in feature_names_in_group:
+            source_meta = feature_sources.get(feature_name, {})
+            grouped_details[group_key].append(
+                _build_feature_detail(
+                    name=feature_name,
+                    value=candidate_values.get(feature_name),
+                    group=group_key,
+                    source=str(source_meta.get("source") or "derived"),
+                    providers=source_meta.get("providers"),
+                    raw_fields=source_meta.get("raw_fields"),
+                    fallback_used=bool(source_meta.get("fallback_used", False)),
+                )
+            )
 
     feature_snapshot = {
         "as_of": as_of.isoformat(),
         "company_name": company_name,
         "quote_currency": quote_currency,
-        "feature_count": len(combined),
-        "headlines_text": sentiment_features["headlines_text"],
+        "feature_count": len(CANDIDATE_FEATURE_NAMES),
+        "selected_feature_count": len(selected_df.columns),
+        "headlines_text": " ".join(item["headline"] for item in normalized_news),
         "groups": [
             {
                 "key": group_key,
@@ -863,39 +1041,10 @@ def build_live_feature_bundle(
         ],
         "news_items": normalized_news,
         "provider_summary": {
-            "finnhub": sum(1 for detail in market_details + context_details if "finnhub" in detail["providers"]),
-            "yahoo": sum(1 for detail in market_details + context_details if "yahoo" in detail["providers"]),
-            "derived": sum(1 for detail in sentiment_details + tfidf_details),
-            "fallback_fields": sum(
-                1
-                for detail in market_details + context_details + sentiment_details + tfidf_details
-                if detail["fallback_used"]
-            ),
+            "gemini": len(GEMINI_FEATURE_NAMES),
+            "fred": len([name for name in MACRO_FEATURE_NAMES if feature_sources.get(name, {}).get("source") == "fred"]),
+            "bigquery": len([name for name in MACRO_FEATURE_NAMES if feature_sources.get(name, {}).get("source") == "bigquery"]),
+            "derived": len(TEMPORAL_FEATURE_NAMES) + 2,
         },
     }
-    return feature_df, feature_snapshot
-
-
-def align_model_features(
-    feature_df: pd.DataFrame,
-    feature_names: Sequence[str] | None = None,
-) -> pd.DataFrame:
-    expected = list(feature_names or MODEL_FEATURE_NAMES)
-
-    missing_base = [column for column in BASE_FEATURE_NAMES if column not in feature_df.columns]
-    if missing_base:
-        raise AssertionError(f"Missing required non-TFIDF features: {missing_base}")
-
-    aligned = feature_df.reindex(columns=expected, fill_value=0.0).copy()
-    aligned = aligned.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    if len(expected) != EXPECTED_FEATURE_COUNT:
-        raise AssertionError(
-            f"Expected {EXPECTED_FEATURE_COUNT} model features, received {len(expected)}."
-        )
-    if aligned.shape[1] != EXPECTED_FEATURE_COUNT:
-        raise AssertionError(
-            f"Feature frame has {aligned.shape[1]} columns, expected {EXPECTED_FEATURE_COUNT}."
-        )
-
-    return aligned
+    return candidate_df, selected_df, feature_snapshot

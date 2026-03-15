@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -12,22 +11,33 @@ import joblib
 import pandas as pd
 from google.cloud import bigquery, storage
 
-from backend.config import get_env, qualify_table_name
+from backend.config import get_env, get_int_env, qualify_table_name
 from backend.ml.shared.feature_engineering import (
-    BASE_FEATURE_NAMES,
-    EXPECTED_FEATURE_COUNT,
     build_live_feature_bundle,
     normalize_headlines,
+    require_live_news_items,
 )
+from backend.ml.shared.gemini_sentiment import score_live_news_items
 from backend.ml.shared.live_data import fetch_live_snapshot
+from backend.ml.shared.live_snapshot_cache import (
+    CACHE_REASON_CACHE_FEATURE_MISMATCH,
+    CACHE_REASON_DAILY_BUDGET_EXHAUSTED,
+    CACHE_SOURCE_MODE_BIGQUERY,
+    CACHE_SOURCE_MODE_LIVE_API,
+    build_cache_status,
+    count_daily_live_fetches,
+    evaluate_cache_reuse,
+    load_latest_cached_snapshot,
+    materialize_cached_snapshot_frames,
+)
+from backend.ml.shared.model_scoring import blend_positive_class_scores, classify_probability
+from backend.ml.shared.macro_features import fetch_live_macro_features, load_latest_universe_breadth
 from backend.ml.shared.snapshot_storage import (
     SNAPSHOT_SOURCE_BATCH,
+    SNAPSHOT_SOURCE_BATCH_CACHE,
     build_live_feature_snapshot_row,
     build_snapshot_id,
 )
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
-logger = logging.getLogger(__name__)
 
 PROJECT_ID = get_env("GCP_PROJECT_ID")
 DATASET_ID = get_env("BQ_DATASET", "BQ_DATASET_ID")
@@ -36,6 +46,10 @@ REQUEST_TABLE = get_env("BATCH_REQUEST_TABLE")
 PREDICTION_TABLE = get_env("BATCH_PREDICTION_TABLE")
 LIVE_FEATURE_SNAPSHOT_TABLE = get_env("LIVE_FEATURE_SNAPSHOT_TABLE")
 FINNHUB_KEY = get_env("FINNHUB_KEY", "FINNHUB_API_KEY")
+FRED_API_KEY = get_env("FRED_API_KEY")
+LIVE_SNAPSHOT_FRESH_TTL_SECONDS = get_int_env("LIVE_SNAPSHOT_FRESH_TTL_SECONDS", default=3600) or 3600
+LIVE_SNAPSHOT_MAX_STALE_TTL_SECONDS = get_int_env("LIVE_SNAPSHOT_MAX_STALE_TTL_SECONDS", default=21600) or 21600
+LIVE_SNAPSHOT_DAILY_LIVE_FETCH_LIMIT = get_int_env("LIVE_SNAPSHOT_DAILY_LIVE_FETCH_LIMIT", default=12) or 12
 
 REQUEST_STATUSES = {
     "pending": "PENDING",
@@ -67,17 +81,15 @@ def _load_model_artifacts(manifest_uri: str) -> tuple[object, object, dict, str]
     bucket = storage_client.bucket(artifact_bucket)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        for filename in ("model.joblib", "tfidf_vectorizer.joblib", "metadata.json"):
-            bucket.blob(f"{artifact_prefix}/{filename}").download_to_filename(
-                os.path.join(tmpdir, filename)
-            )
+        for filename in ("lgb_model.joblib", "xgb_model.joblib", "metadata.json"):
+            bucket.blob(f"{artifact_prefix}/{filename}").download_to_filename(os.path.join(tmpdir, filename))
 
-        model = joblib.load(os.path.join(tmpdir, "model.joblib"))
-        tfidf = joblib.load(os.path.join(tmpdir, "tfidf_vectorizer.joblib"))
+        lgb_model = joblib.load(os.path.join(tmpdir, "lgb_model.joblib"))
+        xgb_model = joblib.load(os.path.join(tmpdir, "xgb_model.joblib"))
         with open(os.path.join(tmpdir, "metadata.json")) as handle:
             metadata = json.load(handle)
 
-    return model, tfidf, metadata, artifact_uri
+    return lgb_model, xgb_model, metadata, artifact_uri
 
 
 def _client() -> bigquery.Client:
@@ -108,6 +120,30 @@ def _live_feature_snapshot_table() -> str:
     )
 
 
+def _training_snapshot_table() -> str:
+    return qualify_table_name(
+        "training_feature_snapshots",
+        project_id=PROJECT_ID or None,
+        dataset_id=DATASET_ID or None,
+    )
+
+
+def _gemini_cache_table() -> str:
+    return qualify_table_name(
+        "gemini_sentiment_cache",
+        project_id=PROJECT_ID or None,
+        dataset_id=DATASET_ID or None,
+    )
+
+
+def _macro_cache_table() -> str:
+    return qualify_table_name(
+        "macro_feature_cache",
+        project_id=PROJECT_ID or None,
+        dataset_id=DATASET_ID or None,
+    )
+
+
 def _pending_batch_ids(client: bigquery.Client) -> list[str]:
     query = f"""
         SELECT batch_id
@@ -117,12 +153,9 @@ def _pending_batch_ids(client: bigquery.Client) -> list[str]:
         ORDER BY MIN(created_at)
     """
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("status", "STRING", REQUEST_STATUSES["pending"])
-        ]
+        query_parameters=[bigquery.ScalarQueryParameter("status", "STRING", REQUEST_STATUSES["pending"])]
     )
-    rows = client.query(query, job_config=job_config).result()
-    return [row.batch_id for row in rows]
+    return [row.batch_id for row in client.query(query, job_config=job_config).result()]
 
 
 def _mark_batch_processing(client: bigquery.Client, batch_id: str) -> None:
@@ -171,11 +204,7 @@ def _load_batch_requests(client: bigquery.Client, batch_id: str) -> pd.DataFrame
 def _delete_existing_predictions(client: bigquery.Client, request_ids: list[str]) -> None:
     if not request_ids:
         return
-
-    query = f"""
-        DELETE FROM `{_prediction_table()}`
-        WHERE request_id IN UNNEST(@request_ids)
-    """
+    query = f"DELETE FROM `{_prediction_table()}` WHERE request_id IN UNNEST(@request_ids)"
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ArrayQueryParameter("request_ids", "STRING", request_ids)]
     )
@@ -185,13 +214,11 @@ def _delete_existing_predictions(client: bigquery.Client, request_ids: list[str]
 def _append_predictions(client: bigquery.Client, predictions_df: pd.DataFrame) -> None:
     if predictions_df.empty:
         return
-
     _delete_existing_predictions(client, predictions_df["request_id"].tolist())
-    load_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
     client.load_table_from_dataframe(
         predictions_df,
         _prediction_table(),
-        job_config=load_config,
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
     ).result()
 
 
@@ -265,33 +292,221 @@ def _validate_live_request_date(as_of_date: pd.Timestamp | pd.NaT) -> str | None
     return None
 
 
+def _load_cached_prediction_inputs(
+    *,
+    ticker: str,
+    metadata: dict,
+    client: bigquery.Client,
+) -> tuple[dict | None, int, dict | None]:
+    now = datetime.now(timezone.utc)
+    daily_live_fetch_count = count_daily_live_fetches(
+        client,
+        table_name=_live_feature_snapshot_table(),
+        ticker=ticker,
+        snapshot_date=now,
+    )
+    cached_snapshot = load_latest_cached_snapshot(
+        client,
+        table_name=_live_feature_snapshot_table(),
+        ticker=ticker,
+    )
+    if not cached_snapshot:
+        return None, daily_live_fetch_count, None
+
+    reuse_decision = evaluate_cache_reuse(
+        cached_snapshot.get("snapshot_timestamp"),
+        now=now,
+        fresh_ttl_seconds=LIVE_SNAPSHOT_FRESH_TTL_SECONDS,
+        max_stale_ttl_seconds=LIVE_SNAPSHOT_MAX_STALE_TTL_SECONDS,
+        daily_live_fetch_limit=LIVE_SNAPSHOT_DAILY_LIVE_FETCH_LIMIT,
+        daily_live_fetch_count=daily_live_fetch_count,
+    )
+    if not reuse_decision["should_use_cache"]:
+        return None, daily_live_fetch_count, {
+            "cached_snapshot": cached_snapshot,
+            "reuse_decision": reuse_decision,
+        }
+
+    cache_status = build_cache_status(
+        source_mode=CACHE_SOURCE_MODE_BIGQUERY,
+        reason=reuse_decision["reason"],
+        snapshot_timestamp=cached_snapshot.get("snapshot_timestamp"),
+        snapshot_age_seconds=reuse_decision["snapshot_age_seconds"],
+        fresh_ttl_seconds=LIVE_SNAPSHOT_FRESH_TTL_SECONDS,
+        max_stale_ttl_seconds=LIVE_SNAPSHOT_MAX_STALE_TTL_SECONDS,
+        daily_live_fetch_limit=LIVE_SNAPSHOT_DAILY_LIVE_FETCH_LIMIT,
+        daily_live_fetch_count=daily_live_fetch_count,
+        cache_hit=True,
+        stale_served=bool(reuse_decision["stale_served"]),
+        quota_exhausted=bool(reuse_decision["quota_exhausted"]),
+        origin_snapshot_id=cached_snapshot.get("snapshot_id"),
+        origin_request_id=cached_snapshot.get("request_id"),
+    )
+    try:
+        candidate_row, selected_row, feature_snapshot = materialize_cached_snapshot_frames(
+            cached_snapshot,
+            feature_names=list(metadata.get("feature_names") or []),
+            cache_status=cache_status,
+        )
+    except AssertionError:
+        return None, daily_live_fetch_count, {
+            "cached_snapshot": cached_snapshot,
+            "reuse_decision": {
+                **reuse_decision,
+                "reason": CACHE_REASON_CACHE_FEATURE_MISMATCH,
+            },
+        }
+    return (
+        {
+            "candidate_row": candidate_row,
+            "selected_row": selected_row,
+            "feature_snapshot": feature_snapshot,
+            "snapshot_timestamp": cached_snapshot.get("snapshot_timestamp"),
+            "snapshot_source": SNAPSHOT_SOURCE_BATCH_CACHE,
+        },
+        daily_live_fetch_count,
+        {
+            "cached_snapshot": cached_snapshot,
+            "reuse_decision": reuse_decision,
+        },
+    )
+
+
 def _score_request(
     request_row,
-    model,
-    tfidf,
+    lgb_model,
+    xgb_model,
     metadata: dict,
     artifact_uri: str,
+    client: bigquery.Client,
 ) -> tuple[dict | None, dict | None, str | None]:
     invalid_date_message = _validate_live_request_date(request_row.as_of_date)
     if invalid_date_message:
         return None, None, invalid_date_message
 
     extra_headlines = normalize_headlines(request_row.headlines)
-    snapshot = fetch_live_snapshot(
-        request_row.ticker,
-        finnhub_key=FINNHUB_KEY,
-        extra_headlines=extra_headlines,
+    prediction_inputs = None
+    daily_live_fetch_count = count_daily_live_fetches(
+        client,
+        table_name=_live_feature_snapshot_table(),
+        ticker=request_row.ticker,
+        snapshot_date=datetime.now(timezone.utc),
     )
-    feature_row, feature_snapshot = build_live_feature_bundle(snapshot, tfidf, metadata.get("feature_names"))
+    cache_context = None
+    if not extra_headlines:
+        prediction_inputs, daily_live_fetch_count, cache_context = _load_cached_prediction_inputs(
+            ticker=request_row.ticker,
+            metadata=metadata,
+            client=client,
+        )
 
-    probability = float(model.predict_proba(feature_row)[0, 1])
-    label = "Up" if probability >= 0.5 else "Down"
-    confidence = probability if probability >= 0.5 else 1.0 - probability
+    if prediction_inputs is None:
+        reuse_decision = (cache_context or {}).get("reuse_decision") or {}
+        if daily_live_fetch_count >= LIVE_SNAPSHOT_DAILY_LIVE_FETCH_LIMIT:
+            if extra_headlines:
+                return (
+                    None,
+                    None,
+                    (
+                        f"Live data budget exhausted for {request_row.ticker}. "
+                        "This batch request includes request-specific headlines, so a cached snapshot cannot be reused."
+                    ),
+                )
+            if reuse_decision.get("reason") == CACHE_REASON_DAILY_BUDGET_EXHAUSTED:
+                cached_snapshot = (cache_context or {}).get("cached_snapshot") or {}
+                snapshot_age_seconds = reuse_decision.get("snapshot_age_seconds")
+                snapshot_age_hours = (
+                    "unknown"
+                    if snapshot_age_seconds is None
+                    else f"{round(float(snapshot_age_seconds) / 3600.0, 1)}h"
+                )
+                return (
+                    None,
+                    None,
+                    (
+                        f"Live data budget exhausted for {request_row.ticker}. "
+                        f"The latest cached snapshot is {snapshot_age_hours} old and exceeds the {round(LIVE_SNAPSHOT_MAX_STALE_TTL_SECONDS / 3600.0, 1)}h stale limit."
+                        + (
+                            f" Latest snapshot: {cached_snapshot.get('snapshot_id')}."
+                            if cached_snapshot.get("snapshot_id")
+                            else ""
+                        )
+                    ),
+                )
+            return (
+                None,
+                None,
+                (
+                    f"Live data budget exhausted for {request_row.ticker}. "
+                    f"The daily live fetch limit is {LIVE_SNAPSHOT_DAILY_LIVE_FETCH_LIMIT} and no reusable cached snapshot is available."
+                ),
+            )
+
+        snapshot = fetch_live_snapshot(request_row.ticker, finnhub_key=FINNHUB_KEY, extra_headlines=extra_headlines)
+        normalized_news = require_live_news_items(snapshot.get("news"), ticker=request_row.ticker)
+        sentiment_features = score_live_news_items(
+            ticker=request_row.ticker,
+            news_items=normalized_news,
+            project_id=PROJECT_ID,
+            region=get_env("GCP_REGION"),
+            cache_client=client,
+            cache_table_name=_gemini_cache_table(),
+        )
+        breadth = load_latest_universe_breadth(
+            client,
+            table_name=_training_snapshot_table(),
+            as_of_date=pd.Timestamp(snapshot["as_of"]),
+        )
+        macro_features = fetch_live_macro_features(
+            fred_api_key=FRED_API_KEY,
+            universe_breadth_50d=breadth,
+            cache_client=client,
+            cache_table_name=_macro_cache_table(),
+            as_of_date=pd.Timestamp(snapshot["as_of"]),
+        )
+        candidate_row, selected_row, feature_snapshot = build_live_feature_bundle(
+            snapshot,
+            sentiment_features=sentiment_features,
+            macro_features=macro_features,
+            feature_names=metadata.get("feature_names"),
+        )
+        feature_snapshot["cache_status"] = build_cache_status(
+            source_mode=CACHE_SOURCE_MODE_LIVE_API,
+            reason="live_refresh",
+            snapshot_timestamp=snapshot["as_of"],
+            snapshot_age_seconds=0,
+            fresh_ttl_seconds=LIVE_SNAPSHOT_FRESH_TTL_SECONDS,
+            max_stale_ttl_seconds=LIVE_SNAPSHOT_MAX_STALE_TTL_SECONDS,
+            daily_live_fetch_limit=LIVE_SNAPSHOT_DAILY_LIVE_FETCH_LIMIT,
+            daily_live_fetch_count=daily_live_fetch_count,
+            cache_hit=False,
+            stale_served=False,
+            quota_exhausted=False,
+        )
+        prediction_inputs = {
+            "candidate_row": candidate_row,
+            "selected_row": selected_row,
+            "feature_snapshot": feature_snapshot,
+            "snapshot_timestamp": pd.Timestamp(snapshot["as_of"]),
+            "snapshot_source": SNAPSHOT_SOURCE_BATCH,
+        }
+
+    candidate_row = prediction_inputs["candidate_row"]
+    selected_row = prediction_inputs["selected_row"]
+    feature_snapshot = prediction_inputs["feature_snapshot"]
+    snapshot_timestamp = pd.Timestamp(prediction_inputs["snapshot_timestamp"])
+    snapshot_source = prediction_inputs["snapshot_source"]
+
+    probability = blend_positive_class_scores(
+        lgb_model.predict_proba(selected_row)[0, 1],
+        xgb_model.predict_proba(selected_row)[0, 1],
+        metadata=metadata,
+    )
+    label, confidence, _threshold = classify_probability(probability, metadata=metadata)
 
     predicted_at = datetime.now(timezone.utc)
-    as_of_ts = pd.Timestamp(snapshot["as_of"])
+    as_of_ts = snapshot_timestamp
     as_of_date = as_of_ts.date()
-    base_feature_values = feature_row.iloc[0][BASE_FEATURE_NAMES].to_dict()
     headlines_text = feature_snapshot.get("headlines_text") or " ".join(
         item.get("headline", "") for item in feature_snapshot.get("news_items", [])
     ).strip()
@@ -311,14 +526,18 @@ def _score_request(
     }
 
     snapshot_row = build_live_feature_snapshot_row(
-        snapshot_id=build_snapshot_id("batch", request_row.ticker, snapshot["as_of"]),
+        snapshot_id=build_snapshot_id(
+            "batchcache" if snapshot_source == SNAPSHOT_SOURCE_BATCH_CACHE else "batch",
+            request_row.ticker,
+            predicted_at if snapshot_source == SNAPSHOT_SOURCE_BATCH_CACHE else snapshot_timestamp,
+        ),
         request_id=request_row.request_id,
         batch_id=request_row.batch_id,
         ticker=request_row.ticker,
-        snapshot_timestamp=snapshot["as_of"],
+        snapshot_timestamp=snapshot_timestamp,
         headlines_text=headlines_text,
-        base_feature_values=base_feature_values,
-        snapshot_source=SNAPSHOT_SOURCE_BATCH,
+        base_feature_values=candidate_row.iloc[0].to_dict(),
+        snapshot_source=snapshot_source,
         feature_snapshot=feature_snapshot,
         quote_currency=feature_snapshot.get("quote_currency"),
         model_artifact_uri=artifact_uri,
@@ -329,16 +548,14 @@ def _score_request(
 def _process_batch(
     client: bigquery.Client,
     batch_id: str,
-    model,
-    tfidf,
+    lgb_model,
+    xgb_model,
     metadata: dict,
     artifact_uri: str,
 ) -> None:
-    logger.info("Processing batch %s", batch_id)
     _mark_batch_processing(client, batch_id)
     requests_df = _load_batch_requests(client, batch_id)
     if requests_df.empty:
-        logger.info("No pending requests found for batch %s", batch_id)
         return
 
     predictions: list[dict] = []
@@ -349,13 +566,13 @@ def _process_batch(
         try:
             prediction_row, snapshot_row, error_message = _score_request(
                 request_row,
-                model,
-                tfidf,
+                lgb_model,
+                xgb_model,
                 metadata,
                 artifact_uri,
+                client,
             )
         except Exception as exc:
-            logger.exception("Live batch inference failed for %s: %s", request_row.ticker, exc)
             prediction_row, snapshot_row, error_message = None, None, str(exc)
 
         if error_message:
@@ -369,48 +586,23 @@ def _process_batch(
     if not predictions_df.empty:
         _append_predictions(client, predictions_df)
         _append_live_feature_snapshots(client, snapshot_rows)
-        _update_request_statuses(
-            client,
-            predictions_df["request_id"].tolist(),
-            REQUEST_STATUSES["complete"],
-        )
+        _update_request_statuses(client, predictions_df["request_id"].tolist(), REQUEST_STATUSES["complete"])
 
     for request_id, error_message in failures.items():
-        _update_request_statuses(
-            client,
-            [request_id],
-            REQUEST_STATUSES["failed"],
-            error_message,
-        )
-
-    logger.info(
-        "Batch %s finished: %d complete, %d failed",
-        batch_id,
-        len(predictions),
-        len(failures),
-    )
+        _update_request_statuses(client, [request_id], REQUEST_STATUSES["failed"], error_message)
 
 
 def main() -> None:
     client = _client()
-    model, tfidf, metadata, artifact_uri = _load_model_artifacts(MODEL_MANIFEST_URI)
-
-    feature_names = metadata.get("feature_names", [])
-    if len(feature_names) != EXPECTED_FEATURE_COUNT:
-        raise RuntimeError(
-            f"Expected a {EXPECTED_FEATURE_COUNT}-feature model artifact, found {len(feature_names)} features."
-        )
-
+    lgb_model, xgb_model, metadata, artifact_uri = _load_model_artifacts(MODEL_MANIFEST_URI)
     pending_batches = _pending_batch_ids(client)
     if not pending_batches:
-        logger.info("No pending batch inference requests found.")
         return
 
     for batch_id in pending_batches:
         try:
-            _process_batch(client, batch_id, model, tfidf, metadata, artifact_uri)
+            _process_batch(client, batch_id, lgb_model, xgb_model, metadata, artifact_uri)
         except Exception as exc:
-            logger.exception("Batch %s failed: %s", batch_id, exc)
             _mark_batch_failed(client, batch_id, str(exc))
 
 

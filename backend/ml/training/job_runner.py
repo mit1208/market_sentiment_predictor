@@ -1,8 +1,9 @@
 """
 Cloud Run Job entrypoint for event-driven training.
 
-Reads market/news data from BigQuery, trains the model, stores artifacts in GCS,
-and promotes a new live model only when it clears the deployment threshold.
+Reads the prepared gold training dataset from BigQuery, trains the model, stores
+artifacts in GCS, and promotes a new live model only when it clears the
+deployment threshold.
 """
 
 import json
@@ -12,9 +13,10 @@ import os
 from google.cloud import bigquery, storage
 
 from backend.config import get_env, get_float_env, qualify_table_name
+from backend.ml.shared.notifications import maybe_send_model_training_notification
 from backend.ml.training.components.train import (
     MODEL_NAME,
-    prepare_training_dataset,
+    load_prepared_gold_training_dataset,
     save_artifacts,
     train_model,
 )
@@ -26,7 +28,8 @@ PROJECT_ID = get_env("GCP_PROJECT_ID")
 REGION = get_env("GCP_REGION")
 DATASET_ID = get_env("BQ_DATASET", "BQ_DATASET_ID")
 GCS_BUCKET = get_env("GCS_BUCKET")
-MIN_ACCURACY = get_float_env("MIN_ACCURACY", default=0.50) or 0.50
+MIN_ACCURACY = get_float_env("MIN_ACCURACY", default=0.52) or 0.52
+NOTIFICATION_WEBHOOK = get_env("FEATURE_RANK_NOTIFICATION_WEBHOOK")
 
 
 def _model_metadata_table() -> str:
@@ -67,7 +70,16 @@ def _write_model_metadata(metrics: dict, artifact_uri: str, deployment_status: s
             project_id=PROJECT_ID or None,
             dataset_id=DATASET_ID or None,
         ),
-        "snapshot_table": metrics["snapshot_table"],
+        "macro_table": qualify_table_name(
+            "raw_macro_data",
+            project_id=PROJECT_ID or None,
+            dataset_id=DATASET_ID or None,
+        ),
+        "silver_table": metrics["snapshot_table"],
+        "gold_table": metrics["gold_table"],
+        "feature_selection_run_id": metrics.get("feature_selection_run_id"),
+        "feature_selection_source": metrics.get("feature_selection_source"),
+        "feature_selection_is_temporary": metrics.get("feature_selection_is_temporary"),
         "tickers": metrics["tickers"],
         "ticker_count": metrics["ticker_count"],
     }
@@ -106,9 +118,18 @@ def main() -> None:
         raise RuntimeError("GCS_BUCKET is not configured for the training job.")
 
     logger.info("Starting event-driven training job")
-    gold, dataset_metadata = prepare_training_dataset()
-    model, tfidf_vectorizer, metrics = train_model(gold, dataset_metadata)
-    artifact_uri = save_artifacts(model, tfidf_vectorizer, metrics)
+    logger.info("Loading prepared gold training data")
+    gold, dataset_metadata = load_prepared_gold_training_dataset()
+    logger.info(
+        "Prepared gold data loaded: rows=%s selected_features=%s source=%s temporary_fallback=%s",
+        dataset_metadata.get("training_rows"),
+        dataset_metadata.get("selected_feature_count"),
+        dataset_metadata.get("feature_selection_source"),
+        dataset_metadata.get("feature_selection_is_temporary"),
+    )
+    logger.info("Starting model fit from prepared gold training data")
+    lgb_model, xgb_model, metrics = train_model(gold, dataset_metadata)
+    artifact_uri = save_artifacts(lgb_model, xgb_model, metrics)
     promoted = float(metrics["cv_acc_mean"]) > MIN_ACCURACY
 
     manifest = {
@@ -117,6 +138,11 @@ def main() -> None:
         "auc": metrics["cv_auc_mean"],
         "holdout_accuracy": metrics["test_metrics"]["accuracy"],
         "holdout_auc": metrics["test_metrics"]["auc"],
+        "candidate_feature_count": metrics.get("candidate_feature_count"),
+        "selected_feature_count": metrics.get("selected_feature_count"),
+        "feature_contract_version": metrics.get("candidate_feature_version"),
+        "feature_selection_source": metrics.get("feature_selection_source"),
+        "feature_selection_is_temporary": metrics.get("feature_selection_is_temporary"),
         "project_id": PROJECT_ID,
         "region": REGION,
         "dataset_id": DATASET_ID,
@@ -128,6 +154,14 @@ def main() -> None:
         artifact_uri,
         "PROMOTED" if promoted else "NOT_PROMOTED",
     )
+
+    if NOTIFICATION_WEBHOOK:
+        notified = maybe_send_model_training_notification(
+            webhook_url=NOTIFICATION_WEBHOOK,
+            manifest={**manifest, "promoted": promoted, "model_name": MODEL_NAME},
+        )
+        if notified:
+            logger.info("Model training completion notification sent.")
 
     if not promoted:
         logger.info(
