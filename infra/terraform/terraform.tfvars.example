@@ -1,6 +1,9 @@
 project_id = "your-project-id"
 region     = "us-central1"
 dataset_id = "market_sentiment_predictor"
+finnhub_key = ""
+fred_api_key = ""
+feature_rank_notification_webhook = ""
 
 # Set to true only for the very first apply in a brand-new project before
 # your own container images have been pushed to Artifact Registry.

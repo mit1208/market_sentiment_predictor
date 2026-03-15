@@ -1,4 +1,4 @@
-"""Live market and news fetchers with Finnhub primary quote data and Yahoo fallback/history."""
+"""Live market and news fetchers."""
 
 from __future__ import annotations
 
@@ -10,7 +10,12 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-from backend.ml.shared.feature_engineering import NEWS_LOOKBACK_DAYS, prepare_price_history_frame
+from backend.ml.shared.feature_engineering import (
+    NEWS_LOOKBACK_DAYS,
+    coerce_scalarlike,
+    is_missing_value,
+    prepare_price_history_frame,
+)
 
 log = logging.getLogger(__name__)
 
@@ -25,10 +30,11 @@ def _trace(
     *,
     fallback_used: bool = False,
 ) -> dict | None:
-    if value is None or pd.isna(value):
+    value = coerce_scalarlike(value)
+    if is_missing_value(value):
         return None
     return {
-        "value": value.item() if hasattr(value, "item") else value,
+        "value": value,
         "provider": provider,
         "raw_field": raw_field,
         "fallback_used": fallback_used,
@@ -55,11 +61,7 @@ def _request_json(path: str, *, token: str | None, params: dict[str, Any]) -> di
         return {}
 
     url = f"{FINNHUB_BASE_URL}/{path.lstrip('/')}"
-    response = requests.get(
-        url,
-        params={**params, "token": token},
-        timeout=15,
-    )
+    response = requests.get(url, params={**params, "token": token}, timeout=15)
     response.raise_for_status()
     return response.json()
 
@@ -102,6 +104,7 @@ def _fetch_finnhub_company_news(symbol: str, token: str | None) -> list[dict]:
                 else datetime.fromtimestamp(int(item["datetime"]), tz=timezone.utc).isoformat(),
             }
             for item in payload
+            if item.get("headline")
         ]
     except Exception as exc:
         log.warning("Finnhub company news failed for %s: %s", symbol, exc)
@@ -128,7 +131,6 @@ def _fetch_yahoo_news(symbol: str) -> list[dict]:
     for item in news_items:
         if not isinstance(item, dict):
             continue
-
         content = item.get("content")
         content_title = content.get("title") if isinstance(content, dict) else None
         title = item.get("title") or content_title
@@ -158,14 +160,12 @@ def _fetch_yahoo_news(symbol: str) -> list[dict]:
                 "published_at": published_at,
             }
         )
-
     return normalized
 
 
 def _normalize_currency_code(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-
     normalized = value.strip().upper()
     return normalized if normalized else None
 
@@ -173,7 +173,6 @@ def _normalize_currency_code(value: object) -> str | None:
 def _normalize_company_name(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-
     normalized = value.strip()
     return normalized if normalized else None
 
@@ -185,7 +184,6 @@ def _fetch_yahoo_currency(symbol: str) -> str | None:
     except Exception as exc:
         log.warning("Yahoo currency lookup failed for %s: %s", symbol, exc)
         return None
-
     return _normalize_currency_code(currency)
 
 
@@ -195,10 +193,7 @@ def _fetch_yahoo_company_name(symbol: str) -> str | None:
     except Exception as exc:
         log.warning("Yahoo company name lookup failed for %s: %s", symbol, exc)
         return None
-
-    return _normalize_company_name(
-        info.get("longName") or info.get("shortName") or info.get("displayName")
-    )
+    return _normalize_company_name(info.get("longName") or info.get("shortName") or info.get("displayName"))
 
 
 def _history_quote_traces(history: pd.DataFrame) -> dict[str, dict]:
@@ -214,12 +209,12 @@ def _history_quote_traces(history: pd.DataFrame) -> dict[str, dict]:
     low = working["low"].astype(float)
     volume = working["volume"].astype(float)
 
-    avg_volume_10d = volume.rolling(10, min_periods=3).mean().iloc[-1]
-    avg_volume_3m = volume.rolling(63, min_periods=10).mean().iloc[-1]
-    fifty_day_avg = close.rolling(50, min_periods=10).mean().iloc[-1]
-    two_hundred_day_avg = close.rolling(200, min_periods=30).mean().iloc[-1]
-    fifty_two_week_high = high.rolling(252, min_periods=30).max().iloc[-1]
-    fifty_two_week_low = low.rolling(252, min_periods=30).min().iloc[-1]
+    avg_volume_10d = volume.rolling(10, min_periods=10).mean().iloc[-1]
+    avg_volume_3m = volume.rolling(63, min_periods=20).mean().iloc[-1]
+    fifty_day_avg = close.rolling(50, min_periods=50).mean().iloc[-1]
+    two_hundred_day_avg = close.rolling(200, min_periods=200).mean().iloc[-1]
+    fifty_two_week_high = high.rolling(252, min_periods=252).max().iloc[-1]
+    fifty_two_week_low = low.rolling(252, min_periods=252).min().iloc[-1]
 
     return {
         "current_price": _trace(latest["close"], "yahoo", "history.close"),
@@ -314,7 +309,7 @@ def build_symbol_snapshot(
         "quote_currency": quote_currency,
         "quote": quote,
         "news": news,
-        "history_rows": int(len(yahoo_history)),
+        "history_rows": yahoo_history.to_dict("records"),
     }
 
 
@@ -353,13 +348,16 @@ def fetch_live_snapshot(
         "quote_currency": ticker_snapshot.get("quote_currency"),
         "quote": ticker_snapshot["quote"],
         "news": ticker_snapshot["news"],
+        "ticker_history": ticker_snapshot["history_rows"],
+        "spy_history": spy_snapshot["history_rows"],
+        "vix_history": vix_snapshot["history_rows"],
         "market_context": {
             "spy": spy_snapshot["quote"],
             "vix": vix_snapshot["quote"],
         },
         "source_health": {
-            "ticker_history_rows": ticker_snapshot["history_rows"],
-            "spy_history_rows": spy_snapshot["history_rows"],
-            "vix_history_rows": vix_snapshot["history_rows"],
+            "ticker_history_rows": len(ticker_snapshot["history_rows"]),
+            "spy_history_rows": len(spy_snapshot["history_rows"]),
+            "vix_history_rows": len(vix_snapshot["history_rows"]),
         },
     }

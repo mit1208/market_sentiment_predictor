@@ -4,9 +4,9 @@ This file provides guidance to AI agents (Codex, Claude Code, etc.) when working
 
 ## Project Overview
 
-End-to-end market sentiment system: ingest market/news data into BigQuery, train and evaluate a
-LightGBM model, serve live predictions from Cloud Run, and expose the results through a Next.js
-frontend.
+End-to-end market sentiment system: ingest market/news data into BigQuery, rebuild a candidate
+feature snapshot table, lock an AutoML-selected feature contract, train an LGB/XGB ensemble, serve
+live predictions from Cloud Run, and expose the results through a Next.js frontend.
 
 ## Current Baseline Metrics
 
@@ -51,8 +51,10 @@ Cloud Scheduler
   -> Cloud Run Job (`backend.ml.training.job_runner`)
 
 Cloud Run Job (`backend.ml.training.job_runner`)
-  -> rebuild historical feature snapshots
-  -> train LightGBM + TF-IDF
+  -> rebuild historical candidate feature snapshots
+  -> score headlines with Gemini + add FRED macro features
+  -> refresh/reuse AutoML feature contract
+  -> train LightGBM + XGBoost ensemble
   -> evaluate with time-based CV + holdout
   -> promote latest manifest in GCS
 
@@ -61,7 +63,9 @@ Cloud Run Job (`backend.ml.inference.batch_job`)
 
 Cloud Run Service (`backend.api.main`)
   -> fetch live market/news features
-  -> load promoted model from GCS
+  -> score live headlines with Gemini
+  -> add live macro context
+  -> load promoted ensemble from GCS
   -> return prediction + feature snapshot
 
 Next.js frontend
@@ -74,8 +78,9 @@ Next.js frontend
 | Concern | Choice | Reason |
 |---------|--------|--------|
 | Workflow | Cloud Function + Cloud Run Jobs | Simple event-driven orchestration for ingest/train/batch inference |
-| Text Sentiment | TF-IDF (Scikit-learn) | Faster, lower cost, no external API calls at inference |
-| ML model | LightGBM + TimeSeriesSplit CV | Fast, handles tabular data, respects time ordering |
+| Text Sentiment | Gemini 2.5 Flash-Lite | Higher-quality financial headline scoring |
+| Feature selection | Vertex AI AutoML Tabular | One-time feature pruning for the production contract |
+| ML model | LightGBM + XGBoost ensemble | Better variance reduction on selected tabular features |
 | Serving | FastAPI on Cloud Run | Pulls promoted artifacts from GCS and computes live features |
 | Infra | Terraform | Reproducible, all resources in one place |
 | Frontend | Next.js | Simple UI and server-side proxy for prediction requests |
@@ -107,6 +112,7 @@ docker build -f backend/ml/Dockerfile -t <REGION>-docker.pkg.dev/<PROJECT>/marke
 - `GCS_BUCKET`
 - `MODEL_MANIFEST_URI`
 - `FINNHUB_KEY`
+- `FRED_API_KEY`
 
 ### API Service (`backend/api/`)
 
@@ -115,6 +121,7 @@ docker build -f backend/ml/Dockerfile -t <REGION>-docker.pkg.dev/<PROJECT>/marke
 - `BQ_DATASET`
 - `MODEL_MANIFEST_URI`
 - `FINNHUB_KEY`
+- `FRED_API_KEY`
 
 ### Frontend
 

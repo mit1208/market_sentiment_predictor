@@ -39,6 +39,14 @@ output "training_job_name" {
   value = google_cloud_run_v2_job.training.name
 }
 
+output "feature_rank_submit_job_name" {
+  value = google_cloud_run_v2_job.feature_ranking_submit.name
+}
+
+output "feature_rank_finalize_job_name" {
+  value = google_cloud_run_v2_job.feature_ranking_finalize.name
+}
+
 output "batch_inference_job_name" {
   value = google_cloud_run_v2_job.batch_inference.name
 }

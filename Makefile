@@ -1,6 +1,7 @@
 ifneq (,$(wildcard .env))
 include .env
 export FINNHUB_KEY
+export FRED_API_KEY
 endif
 
 TF_DIR ?= infra/terraform
@@ -26,6 +27,10 @@ PIPELINE_IMAGE ?= $(REPO)/pipeline:latest
 ENDPOINT_IMAGE ?= $(REPO)/endpoint:latest
 
 TRAIN_JOB ?= market-sentiment-train
+TRAIN_PREP_JOB ?= market-sentiment-prepare-training-data
+FEATURE_RANK_SUBMIT_JOB ?= market-sentiment-feature-rank-submit
+FEATURE_RANK_FINALIZE_JOB ?= market-sentiment-feature-rank-finalize
+FEATURE_RANK_STATUS_JOB ?= market-sentiment-feature-rank-status
 BATCH_JOB ?= market-sentiment-batch-infer
 PREDICT_SERVICE ?= market-sentiment-predict
 INGEST_FUNCTION ?= market-data-ingestion
@@ -33,10 +38,21 @@ PREDICT_HEALTH_URL ?= $$(gcloud run services describe $(PREDICT_SERVICE) --proje
 GCLOUD_ENV_DELIM := ^@^
 TRAINING_TICKERS_ENV := $(if $(TRAINING_TICKERS),@TRAINING_TICKERS=$(TRAINING_TICKERS),)
 TRAINING_TICKERS_REMOVE_ARGS := $(if $(TRAINING_TICKERS),,--remove-env-vars TRAINING_TICKERS)
-TRAINING_ENV_VARS := GCP_PROJECT_ID=$(PROJECT_ID)@GCP_REGION=$(REGION)@BQ_DATASET=$(BQ_DATASET_ID)@GCS_BUCKET=$(GCS_BUCKET)@MIN_ACCURACY=0.50@MODEL_NAME=market_sentiment_lgbm@FINNHUB_KEY=$(FINNHUB_KEY)$(TRAINING_TICKERS_ENV)@BOOTSTRAP_MARKET_START=$(BOOTSTRAP_MARKET_START)@BOOTSTRAP_NEWS_DAYS=$(BOOTSTRAP_NEWS_DAYS)
-INGESTION_ENV_VARS := GCP_PROJECT_ID=$(PROJECT_ID)@GCP_REGION=$(REGION)@BQ_DATASET_ID=$(BQ_DATASET_ID)@TRAINING_JOB_NAME=$(TRAIN_JOB)@FINNHUB_KEY=$(FINNHUB_KEY)$(TRAINING_TICKERS_ENV)@BOOTSTRAP_MARKET_START=$(BOOTSTRAP_MARKET_START)@BOOTSTRAP_NEWS_DAYS=$(BOOTSTRAP_NEWS_DAYS)
+FEATURE_RANK_NOTIFICATION_WEBHOOK_ENV := $(if $(FEATURE_RANK_NOTIFICATION_WEBHOOK),@FEATURE_RANK_NOTIFICATION_WEBHOOK=$(FEATURE_RANK_NOTIFICATION_WEBHOOK),)
+FEATURE_RANK_NOTIFICATION_REMOVE_ARGS := $(if $(FEATURE_RANK_NOTIFICATION_WEBHOOK),,--remove-env-vars FEATURE_RANK_NOTIFICATION_WEBHOOK)
+FEATURE_RANK_RUN_ID_EXEC_ARG := $(if $(FEATURE_RANK_RUN_ID),--update-env-vars FEATURE_RANK_RUN_ID=$(FEATURE_RANK_RUN_ID),)
+SMOKE_AUTO_ML_SAMPLE_ROWS ?= 1000
+SMOKE_AUTO_ML_MIN_ROWS ?= 1000
+SMOKE_AUTO_ML_BUDGET_MILLI_NODE_HOURS ?= 1000
+SMOKE_AUTO_ML_MAX_SELECTED_FEATURES ?= 10
+TRAINING_ENV_VARS := GCP_PROJECT_ID=$(PROJECT_ID)@GCP_REGION=$(REGION)@BQ_DATASET=$(BQ_DATASET_ID)@GCS_BUCKET=$(GCS_BUCKET)@MIN_ACCURACY=0.52@MODEL_NAME=market_sentiment_lgbm$(TRAINING_TICKERS_ENV)$(FEATURE_RANK_NOTIFICATION_WEBHOOK_ENV)
+FEATURE_RANK_SUBMIT_ENV_VARS := GCP_PROJECT_ID=$(PROJECT_ID)@GCP_REGION=$(REGION)@BQ_DATASET=$(BQ_DATASET_ID)@GCS_BUCKET=$(GCS_BUCKET)@MODEL_NAME=market_sentiment_lgbm$(TRAINING_TICKERS_ENV)
+FEATURE_RANK_FINALIZE_ENV_VARS := $(FEATURE_RANK_SUBMIT_ENV_VARS)$(FEATURE_RANK_NOTIFICATION_WEBHOOK_ENV)
+FEATURE_RANK_STATUS_ENV_VARS := $(FEATURE_RANK_SUBMIT_ENV_VARS)
+BATCH_ENV_VARS := GCP_PROJECT_ID=$(PROJECT_ID)@GCP_REGION=$(REGION)@BQ_DATASET=$(BQ_DATASET_ID)@GCS_BUCKET=$(GCS_BUCKET)@MODEL_NAME=market_sentiment_lgbm@FINNHUB_KEY=$(FINNHUB_KEY)@FRED_API_KEY=$(FRED_API_KEY)
+INGESTION_ENV_VARS := GCP_PROJECT_ID=$(PROJECT_ID)@GCP_REGION=$(REGION)@BQ_DATASET_ID=$(BQ_DATASET_ID)@FINNHUB_KEY=$(FINNHUB_KEY)@FRED_API_KEY=$(FRED_API_KEY)$(TRAINING_TICKERS_ENV)@BOOTSTRAP_MARKET_START=$(BOOTSTRAP_MARKET_START)@BOOTSTRAP_NEWS_DAYS=$(BOOTSTRAP_NEWS_DAYS)
 
-.PHONY: auth bootstrap-init bootstrap-plan bootstrap-apply infra-init infra-plan infra-apply build-pipeline build-endpoint ensure-train-job update-pipeline-jobs update-endpoint-service deploy-pipeline deploy-endpoint deploy-function ingest train verify-endpoint test test-ml test-all test-live-predict scan-secrets rollout migrate
+.PHONY: auth bootstrap-init bootstrap-plan bootstrap-apply infra-init infra-plan infra-apply build-pipeline build-endpoint ensure-train-job ensure-train-prep-job ensure-feature-rank-submit-job ensure-feature-rank-finalize-job ensure-feature-rank-status-job update-pipeline-jobs update-endpoint-service deploy-pipeline deploy-endpoint deploy-function ingest submit-feature-ranking submit-feature-ranking-smoke check-feature-ranking finalize-feature-ranking select-features prepare-training-data train verify-endpoint test test-ml test-all test-live-predict scan-secrets rollout migrate
 
 SECRET_GREP_PATTERN := AIza[0-9A-Za-z_-]{35}|sk-[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|ya29\.[A-Za-z0-9._-]+
 
@@ -86,18 +102,119 @@ ensure-train-job:
 			--set-env-vars "$(GCLOUD_ENV_DELIM)$(TRAINING_ENV_VARS)"; \
 	fi
 
+ensure-train-prep-job:
+	@if gcloud run jobs describe $(TRAIN_PREP_JOB) --project=$(PROJECT_ID) --region=$(REGION) >/dev/null 2>&1; then \
+		echo "Cloud Run job $(TRAIN_PREP_JOB) already exists."; \
+	else \
+		echo "Creating Cloud Run job $(TRAIN_PREP_JOB)..."; \
+		gcloud run jobs create $(TRAIN_PREP_JOB) \
+			--project=$(PROJECT_ID) \
+			--image $(PIPELINE_IMAGE) \
+			--region=$(REGION) \
+			--command python \
+			--args=-m,backend.ml.training.prepare_training_data_job \
+			--memory 4Gi \
+			--cpu 1 \
+			--max-retries 0 \
+			--task-timeout 3600 \
+			--service-account $(PIPELINE_SERVICE_ACCOUNT) \
+			--set-env-vars "$(GCLOUD_ENV_DELIM)$(TRAINING_ENV_VARS)"; \
+	fi
+
+ensure-feature-rank-submit-job:
+	@if gcloud run jobs describe $(FEATURE_RANK_SUBMIT_JOB) --project=$(PROJECT_ID) --region=$(REGION) >/dev/null 2>&1; then \
+		echo "Cloud Run job $(FEATURE_RANK_SUBMIT_JOB) already exists."; \
+	else \
+		echo "Creating Cloud Run job $(FEATURE_RANK_SUBMIT_JOB)..."; \
+		gcloud run jobs create $(FEATURE_RANK_SUBMIT_JOB) \
+			--project=$(PROJECT_ID) \
+			--image $(PIPELINE_IMAGE) \
+			--region=$(REGION) \
+			--command python \
+			--args=-m,backend.ml.training.feature_ranking_submit_job \
+			--memory 4Gi \
+			--cpu 1 \
+			--max-retries 0 \
+			--task-timeout 3600 \
+			--service-account $(PIPELINE_SERVICE_ACCOUNT) \
+			--set-env-vars "$(GCLOUD_ENV_DELIM)$(FEATURE_RANK_SUBMIT_ENV_VARS)"; \
+	fi
+
+ensure-feature-rank-finalize-job:
+	@if gcloud run jobs describe $(FEATURE_RANK_FINALIZE_JOB) --project=$(PROJECT_ID) --region=$(REGION) >/dev/null 2>&1; then \
+		echo "Cloud Run job $(FEATURE_RANK_FINALIZE_JOB) already exists."; \
+	else \
+		echo "Creating Cloud Run job $(FEATURE_RANK_FINALIZE_JOB)..."; \
+		gcloud run jobs create $(FEATURE_RANK_FINALIZE_JOB) \
+			--project=$(PROJECT_ID) \
+			--image $(PIPELINE_IMAGE) \
+			--region=$(REGION) \
+			--command python \
+			--args=-m,backend.ml.training.feature_ranking_finalize_job \
+			--memory 4Gi \
+			--cpu 1 \
+			--max-retries 0 \
+			--task-timeout 3600 \
+			--service-account $(PIPELINE_SERVICE_ACCOUNT) \
+			--set-env-vars "$(GCLOUD_ENV_DELIM)$(FEATURE_RANK_FINALIZE_ENV_VARS)"; \
+	fi
+
+ensure-feature-rank-status-job:
+	@if gcloud run jobs describe $(FEATURE_RANK_STATUS_JOB) --project=$(PROJECT_ID) --region=$(REGION) >/dev/null 2>&1; then \
+		echo "Cloud Run job $(FEATURE_RANK_STATUS_JOB) already exists."; \
+	else \
+		echo "Creating Cloud Run job $(FEATURE_RANK_STATUS_JOB)..."; \
+		gcloud run jobs create $(FEATURE_RANK_STATUS_JOB) \
+			--project=$(PROJECT_ID) \
+			--image $(PIPELINE_IMAGE) \
+			--region=$(REGION) \
+			--command python \
+			--args=-m,backend.ml.training.feature_ranking_status_job \
+			--memory 1Gi \
+			--cpu 1 \
+			--max-retries 0 \
+			--task-timeout 600 \
+			--service-account $(PIPELINE_SERVICE_ACCOUNT) \
+			--set-env-vars "$(GCLOUD_ENV_DELIM)$(FEATURE_RANK_STATUS_ENV_VARS)"; \
+	fi
+
 update-pipeline-jobs:
 	$(MAKE) ensure-train-job
+	$(MAKE) ensure-train-prep-job
+	$(MAKE) ensure-feature-rank-submit-job
+	$(MAKE) ensure-feature-rank-finalize-job
+	$(MAKE) ensure-feature-rank-status-job
 	gcloud run jobs update $(TRAIN_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) $(TRAINING_TICKERS_REMOVE_ARGS) --update-env-vars "$(GCLOUD_ENV_DELIM)$(TRAINING_ENV_VARS)"
-	gcloud run jobs update $(BATCH_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) --update-env-vars FINNHUB_KEY=$(FINNHUB_KEY)
+	gcloud run jobs update $(TRAIN_PREP_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) $(TRAINING_TICKERS_REMOVE_ARGS) --update-env-vars "$(GCLOUD_ENV_DELIM)$(TRAINING_ENV_VARS)"
+	gcloud run jobs update $(FEATURE_RANK_SUBMIT_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) $(TRAINING_TICKERS_REMOVE_ARGS) --update-env-vars "$(GCLOUD_ENV_DELIM)$(FEATURE_RANK_SUBMIT_ENV_VARS)"
+	gcloud run jobs update $(FEATURE_RANK_FINALIZE_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) $(TRAINING_TICKERS_REMOVE_ARGS) $(FEATURE_RANK_NOTIFICATION_REMOVE_ARGS) --update-env-vars "$(GCLOUD_ENV_DELIM)$(FEATURE_RANK_FINALIZE_ENV_VARS)"
+	gcloud run jobs update $(FEATURE_RANK_STATUS_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) $(TRAINING_TICKERS_REMOVE_ARGS) --update-env-vars "$(GCLOUD_ENV_DELIM)$(FEATURE_RANK_STATUS_ENV_VARS)"
+	gcloud run jobs update $(BATCH_JOB) --project=$(PROJECT_ID) --image $(PIPELINE_IMAGE) --region=$(REGION) --update-env-vars "$(GCLOUD_ENV_DELIM)$(BATCH_ENV_VARS)"
 
 deploy-pipeline: auth build-pipeline update-pipeline-jobs
+
+submit-feature-ranking:
+	gcloud run jobs execute $(FEATURE_RANK_SUBMIT_JOB) --project=$(PROJECT_ID) --region=$(REGION) --wait
+
+submit-feature-ranking-smoke:
+	gcloud run jobs execute $(FEATURE_RANK_SUBMIT_JOB) --project=$(PROJECT_ID) --region=$(REGION) --wait --update-env-vars AUTO_ML_REFRESH=true,AUTO_ML_SAMPLE_ROWS=$(SMOKE_AUTO_ML_SAMPLE_ROWS),AUTO_ML_MIN_ROWS=$(SMOKE_AUTO_ML_MIN_ROWS),AUTO_ML_BUDGET_MILLI_NODE_HOURS=$(SMOKE_AUTO_ML_BUDGET_MILLI_NODE_HOURS),AUTO_ML_MAX_SELECTED_FEATURES=$(SMOKE_AUTO_ML_MAX_SELECTED_FEATURES)
+
+check-feature-ranking:
+	gcloud run jobs execute $(FEATURE_RANK_STATUS_JOB) --project=$(PROJECT_ID) --region=$(REGION) --wait $(FEATURE_RANK_RUN_ID_EXEC_ARG)
+
+finalize-feature-ranking:
+	gcloud run jobs execute $(FEATURE_RANK_FINALIZE_JOB) --project=$(PROJECT_ID) --region=$(REGION) --wait
+
+select-features: submit-feature-ranking
+
+prepare-training-data:
+	gcloud run jobs execute $(TRAIN_PREP_JOB) --project=$(PROJECT_ID) --region=$(REGION) --wait
 
 train:
 	gcloud run jobs execute $(TRAIN_JOB) --project=$(PROJECT_ID) --region=$(REGION) --wait
 
 update-endpoint-service:
-	gcloud run services update $(PREDICT_SERVICE) --project=$(PROJECT_ID) --image $(ENDPOINT_IMAGE) --region=$(REGION) --update-env-vars FINNHUB_KEY=$(FINNHUB_KEY)
+	gcloud run services update $(PREDICT_SERVICE) --project=$(PROJECT_ID) --image $(ENDPOINT_IMAGE) --region=$(REGION) --update-env-vars FINNHUB_KEY=$(FINNHUB_KEY),FRED_API_KEY=$(FRED_API_KEY)
 
 deploy-endpoint: auth build-endpoint update-endpoint-service
 
@@ -186,5 +303,5 @@ migrate: up
 # rollback: Alias for 'down'
 rollback: down
 
-# rollout: Deploy the full pipeline including database migrations and data refresh
-rollout: migrate deploy-pipeline deploy-function ingest train deploy-endpoint verify-endpoint
+# rollout: Deploy the pipeline, ingest bronze data, and submit feature ranking. Training remains manual after review.
+rollout: migrate deploy-pipeline deploy-function ingest submit-feature-ranking deploy-endpoint verify-endpoint

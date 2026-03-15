@@ -47,6 +47,31 @@ interface NewsItem {
   provider: string;
   url?: string | null;
   published_at?: string | null;
+  sentiment_score?: number | null;
+  magnitude?: number | null;
+  category?: string | null;
+  scored_at?: string | null;
+  sentiment_label?: "positive" | "negative" | "neutral" | string | null;
+}
+
+interface CacheStatus {
+  source_mode: "live_api" | "bigquery_cache" | string;
+  reason: string;
+  cache_hit: boolean;
+  stale_served: boolean;
+  quota_exhausted: boolean;
+  snapshot_timestamp?: string | null;
+  snapshot_age_seconds?: number | null;
+  snapshot_age_minutes?: number | null;
+  fresh_ttl_seconds?: number | null;
+  fresh_ttl_minutes?: number | null;
+  max_stale_ttl_seconds?: number | null;
+  max_stale_ttl_minutes?: number | null;
+  daily_live_fetch_limit?: number | null;
+  daily_live_fetch_count?: number | null;
+  daily_live_fetch_remaining?: number | null;
+  origin_snapshot_id?: string | null;
+  origin_request_id?: string | null;
 }
 
 interface FeatureSnapshot {
@@ -54,9 +79,11 @@ interface FeatureSnapshot {
   company_name?: string | null;
   quote_currency?: string | null;
   feature_count: number;
+  selected_feature_count?: number;
   headlines_text?: string;
   groups: FeatureGroup[];
   news_items: NewsItem[];
+  cache_status?: CacheStatus | null;
   provider_summary?: {
     finnhub?: number;
     yahoo?: number;
@@ -79,6 +106,9 @@ interface ModelQuality {
   used_feature_count?: number;
   zero_importance_feature_count?: number;
   top_features?: ModelFeatureImportance[];
+  feature_selection_source?: string | null;
+  feature_selection_mode?: string | null;
+  feature_selection_is_temporary?: boolean;
 }
 
 interface PredictionResult {
@@ -368,6 +398,95 @@ function getNewsTone(sentimentScore: number | null, headlineCount: number | null
     panelClasses: "border-amber-200/80 bg-amber-50/70",
     itemClasses: "border-amber-100/90 bg-white hover:border-amber-200 hover:bg-amber-50/40",
   };
+}
+
+function getHeadlineSentimentTone(item: NewsItem) {
+  const score = typeof item.sentiment_score === "number" ? item.sentiment_score : null;
+  const label = (item.sentiment_label ?? "").toString().toLowerCase();
+
+  if ((score !== null && score >= 0.05) || label === "positive") {
+    return {
+      label: "Positive",
+      scoreLabel: score === null ? "n/a" : score.toFixed(2),
+      chipClasses: "border-emerald-200 bg-emerald-50 text-emerald-700",
+      cardClasses: "border-emerald-200/80 bg-emerald-50/35 hover:border-emerald-300 hover:bg-emerald-50/55",
+      scoreClasses: "text-emerald-700",
+    };
+  }
+
+  if ((score !== null && score <= -0.05) || label === "negative") {
+    return {
+      label: "Negative",
+      scoreLabel: score === null ? "n/a" : score.toFixed(2),
+      chipClasses: "border-rose-200 bg-rose-50 text-rose-700",
+      cardClasses: "border-rose-200/80 bg-rose-50/35 hover:border-rose-300 hover:bg-rose-50/55",
+      scoreClasses: "text-rose-700",
+    };
+  }
+
+  return {
+    label: "Neutral",
+    scoreLabel: score === null ? "n/a" : score.toFixed(2),
+    chipClasses: "border-amber-200 bg-amber-50 text-amber-800",
+    cardClasses: "border-amber-200/80 bg-amber-50/35 hover:border-amber-300 hover:bg-amber-50/55",
+    scoreClasses: "text-amber-800",
+  };
+}
+
+function getCacheTone(cacheStatus: CacheStatus | null | undefined) {
+  if (!cacheStatus) {
+    return {
+      label: "Mode n/a",
+      chipClasses: "border-slate-200 bg-slate-100 text-slate-700",
+      summary: "No cache metadata was returned for this snapshot.",
+    };
+  }
+
+  if (cacheStatus.source_mode === "live_api") {
+    return {
+      label: "Live API",
+      chipClasses: "border-teal-200 bg-teal-50 text-teal-700",
+      summary:
+        "This prediction refreshed live market and news inputs directly from upstream providers.",
+    };
+  }
+
+  if (cacheStatus.stale_served) {
+    return {
+      label: "BQ cache stale",
+      chipClasses: "border-amber-200 bg-amber-50 text-amber-800",
+      summary:
+        "This prediction reused a cached BigQuery snapshot because the ticker hit its daily live-fetch budget.",
+    };
+  }
+
+  return {
+    label: "BQ cache",
+    chipClasses: "border-indigo-200 bg-indigo-50 text-indigo-700",
+    summary:
+      "This prediction reused a recent BigQuery snapshot instead of calling live providers again.",
+  };
+}
+
+function getAverageNewsAgeHours(items: NewsItem[], nowMs: number): number | null {
+  const ageHours = items
+    .map((item) => {
+      if (!item.published_at) {
+        return null;
+      }
+      const publishedAtMs = new Date(item.published_at).getTime();
+      if (Number.isNaN(publishedAtMs)) {
+        return null;
+      }
+      return Math.max(0, (nowMs - publishedAtMs) / (1000 * 60 * 60));
+    })
+    .filter((value): value is number => value !== null);
+
+  if (ageHours.length === 0) {
+    return null;
+  }
+
+  return ageHours.reduce((sum, value) => sum + value, 0) / ageHours.length;
 }
 
 function normalizeHeadline(headline: string): string {
@@ -712,25 +831,47 @@ function NewsRail({
 
       <div className="mt-4 min-h-0 flex-1 overflow-hidden rounded-[24px] border border-white/60 bg-white/55 p-2">
         <div className="h-full space-y-3 overflow-y-auto pr-1">
-          {items.map((item, index) => (
-            <a
-              key={`${item.headline}-${index}`}
-              href={item.url ?? undefined}
-              target={item.url ? "_blank" : undefined}
-              rel={item.url ? "noreferrer" : undefined}
-              className={clsx(
-                "block rounded-[22px] border px-4 py-3 transition",
-                tone.itemClasses,
-              )}
-            >
-              <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.18em] text-slate-400">
-                <span>{item.provider}</span>
-                {item.source ? <span>{item.source}</span> : null}
-                {item.published_at ? <span>{formatRelativeTime(item.published_at, nowMs)}</span> : null}
-              </div>
-              <p className="mt-2 text-sm leading-6 text-slate-800">{item.headline}</p>
-            </a>
-          ))}
+          {items.map((item, index) => {
+            const sentimentTone = getHeadlineSentimentTone(item);
+            return (
+              <a
+                key={`${item.headline}-${index}`}
+                href={item.url ?? undefined}
+                target={item.url ? "_blank" : undefined}
+                rel={item.url ? "noreferrer" : undefined}
+                className={clsx(
+                  "block rounded-[22px] border px-4 py-3 transition",
+                  tone.itemClasses,
+                  sentimentTone.cardClasses,
+                )}
+              >
+                <div className="flex flex-wrap items-center gap-2 text-[11px] font-medium uppercase tracking-[0.18em] text-slate-400">
+                  <span>{item.provider}</span>
+                  {item.source ? <span>{item.source}</span> : null}
+                  {item.published_at ? <span>{formatRelativeTime(item.published_at, nowMs)}</span> : null}
+                </div>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <span
+                    className={clsx(
+                      "rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]",
+                      sentimentTone.chipClasses,
+                    )}
+                  >
+                    {sentimentTone.label}
+                  </span>
+                  <span className={clsx("text-xs font-semibold", sentimentTone.scoreClasses)}>
+                    Gemini {sentimentTone.scoreLabel}
+                  </span>
+                  {item.category ? (
+                    <span className="rounded-full bg-white/80 px-2.5 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-slate-600">
+                      {item.category}
+                    </span>
+                  ) : null}
+                </div>
+                <p className="mt-2 text-sm leading-6 text-slate-800">{item.headline}</p>
+              </a>
+            );
+          })}
         </div>
       </div>
     </div>
@@ -826,12 +967,14 @@ export default function Home() {
   const quoteCurrency = activeResult
     ? getDisplayCurrency(activeResult.ticker, activeResult.feature_snapshot.quote_currency)
     : null;
-  const sentimentScore = activeResult ? getNumericFeature(activeResult, "sentiment_score") : null;
+  const sentimentScore = activeResult ? getNumericFeature(activeResult, "gemini_sentiment_avg") : null;
   const headlineCount = activeResult ? getNumericFeature(activeResult, "headline_count") : null;
   const vixLevel = activeResult ? getNumericFeature(activeResult, "vix_level") : null;
   const spyChangePct = activeResult ? getNumericFeature(activeResult, "spy_change_pct") : null;
+  const cacheStatus = activeResult?.feature_snapshot.cache_status ?? null;
+  const cacheTone = getCacheTone(cacheStatus);
   const avgNewsAgeHours = activeResult
-    ? getNumericFeature(activeResult, "avg_news_age_hours")
+    ? getAverageNewsAgeHours(getDedupedNewsItems(activeResult.feature_snapshot.news_items), nowMs)
     : null;
   const volumeVsAvg10d = activeResult
     ? getNumericFeature(activeResult, "volume_vs_avg_10d")
@@ -1093,6 +1236,14 @@ export default function Home() {
                       >
                         {newsTone.label}
                       </div>
+                      <div
+                        className={clsx(
+                          "rounded-full border px-4 py-2 text-sm font-semibold",
+                          cacheTone.chipClasses,
+                        )}
+                      >
+                        {cacheTone.label}
+                      </div>
                     </div>
                   </div>
 
@@ -1201,8 +1352,8 @@ export default function Home() {
                     <MetricCard
                       icon={<Brain className="h-4 w-4 text-slate-500" />}
                       label="Transparency"
-                      value="50 features"
-                      detail="Grouped and searchable with raw source field references."
+                      value="Full frame"
+                      detail="Grouped model inputs, per-headline Gemini sentiment, and live-vs-cache lineage."
                     />
                   </div>
                 </div>
@@ -1309,6 +1460,23 @@ export default function Home() {
                       />
                       <MetricCard
                         icon={<Clock3 className="h-4 w-4 text-slate-500" />}
+                        label="Data mode"
+                        value={cacheTone.label}
+                        detail={
+                          cacheStatus
+                            ? `${cacheTone.summary} Age ${cacheStatus.snapshot_age_minutes ?? "n/a"}m. Remaining live budget ${cacheStatus.daily_live_fetch_remaining ?? "n/a"}/${cacheStatus.daily_live_fetch_limit ?? "n/a"}.`
+                            : cacheTone.summary
+                        }
+                        accent={
+                          cacheStatus?.source_mode === "live_api"
+                            ? "text-teal-700"
+                            : cacheStatus?.stale_served
+                              ? "text-amber-800"
+                              : "text-indigo-700"
+                        }
+                      />
+                      <MetricCard
+                        icon={<Clock3 className="h-4 w-4 text-slate-500" />}
                         label="News input"
                         value={
                           headlineCount !== null
@@ -1335,7 +1503,7 @@ export default function Home() {
                             Technical input frame
                           </div>
                           <p className="mt-2 text-sm leading-6 text-slate-600">
-                            Expand this only when you want the raw 50-field model input. The
+                            Expand this only when you want the raw model input frame. The
                             `tfidf_*` headline-vector fields are internal dimensions, not natural-language explanations.
                           </p>
                         </div>
@@ -1343,7 +1511,7 @@ export default function Home() {
                           onClick={() => setShowAllInputs((current) => !current)}
                           className="rounded-full bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
                         >
-                          {showAllInputs ? "Hide raw inputs" : "Show all 50 inputs"}
+                          {showAllInputs ? "Hide raw inputs" : `Show all ${activeResult.feature_snapshot.feature_count} inputs`}
                         </button>
                       </div>
                     </div>
@@ -1386,37 +1554,43 @@ export default function Home() {
                     <div className="rounded-[28px] border border-slate-200/70 bg-white/85 p-5 shadow-[0_22px_70px_-44px_rgba(15,23,42,0.45)] backdrop-blur">
                       <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
                         <Sparkles className="h-4 w-4 text-slate-500" />
-                        Model frame
+                        Data transparency
                       </div>
                       <div className="mt-4 grid gap-3">
                         <div className="rounded-[22px] bg-slate-100 px-4 py-3">
                           <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-                            feature volume
+                            snapshot source
+                          </p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">
+                            {cacheTone.label}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">{cacheTone.summary}</p>
+                        </div>
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            freshness + quota
+                          </p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">
+                            {cacheStatus?.snapshot_age_minutes !== undefined &&
+                            cacheStatus?.snapshot_age_minutes !== null
+                              ? `${cacheStatus.snapshot_age_minutes.toFixed(1)}m old`
+                              : "n/a"}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {cacheStatus
+                              ? `${cacheStatus.daily_live_fetch_count ?? "n/a"} of ${cacheStatus.daily_live_fetch_limit ?? "n/a"} live fetches used today for this ticker`
+                              : "No live-cache telemetry available"}
+                          </p>
+                        </div>
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            feature frame
                           </p>
                           <p className="mt-2 text-2xl font-semibold text-slate-950">
                             {activeResult.feature_snapshot.feature_count}
                           </p>
-                        </div>
-                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
-                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-                            non-zero importance features
-                          </p>
-                          <p className="mt-2 text-2xl font-semibold text-slate-950">
-                            {activeResult.model_quality?.used_feature_count ?? "n/a"}
-                          </p>
                           <p className="mt-1 text-xs text-slate-500">
-                            {activeResult.model_quality?.zero_importance_feature_count ?? "n/a"} zero-importance inputs in this model
-                          </p>
-                        </div>
-                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
-                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-                            audit target
-                          </p>
-                          <p className="mt-2 text-sm font-semibold text-slate-950">
-                            BigQuery live_feature_snapshots
-                          </p>
-                          <p className="mt-1 text-xs text-slate-500">
-                            request_id {activeResult.request_id}
+                            {activeResult.feature_snapshot.selected_feature_count ?? activeResult.model_quality?.used_feature_count ?? "n/a"} selected by the active model
                           </p>
                         </div>
                       </div>
@@ -1448,6 +1622,19 @@ export default function Home() {
                           </p>
                           <p className="mt-1 text-xs text-slate-500">
                             {formatRelativeTime(activeResult.predicted_at, nowMs)}
+                          </p>
+                        </div>
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            Cache lineage
+                          </p>
+                          <p className="mt-2 text-sm font-semibold text-slate-950">
+                            {cacheStatus?.origin_snapshot_id ?? "Current live snapshot"}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {cacheStatus?.origin_request_id
+                              ? `Derived from request ${cacheStatus.origin_request_id}`
+                              : `Current request ${activeResult.request_id}`}
                           </p>
                         </div>
                       </div>
