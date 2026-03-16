@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getServerSession } from "next-auth/next";
+import { authOptions } from "@/lib/auth";
+import { getFreshSnapshots, logUserPrediction } from "@/lib/bigquery";
 
 export const runtime = "nodejs";
+
+const LIVE_SNAPSHOT_FRESH_TTL_SECONDS = parseInt(process.env.LIVE_SNAPSHOT_FRESH_TTL_SECONDS || "3600", 10);
 
 interface FeatureSnapshotPayload {
   company_name?: string | null;
@@ -9,8 +14,15 @@ interface FeatureSnapshotPayload {
 }
 
 interface PredictionPayload {
-  ticker?: string;
-  feature_snapshot?: FeatureSnapshotPayload | null;
+  request_id: string;
+  ticker: string;
+  prediction: string;
+  confidence: number;
+  prob_up: number;
+  as_of: string;
+  predicted_at: string;
+  feature_snapshot: FeatureSnapshotPayload;
+  model_artifact_uri?: string | null;
   [key: string]: unknown;
 }
 
@@ -119,17 +131,16 @@ async function fetchTickerProfiles(
   }
 }
 
-async function enrichPredictionPayload(payload: unknown): Promise<unknown> {
+async function enrichPredictionPayload(payload: PredictResponsePayload): Promise<PredictResponsePayload> {
   if (!payload || typeof payload !== "object") {
     return payload;
   }
 
-  const responsePayload = payload as PredictResponsePayload;
-  if (!Array.isArray(responsePayload.predictions) || responsePayload.predictions.length === 0) {
+  if (!Array.isArray(payload.predictions) || payload.predictions.length === 0) {
     return payload;
   }
 
-  const tickersNeedingProfiles = responsePayload.predictions
+  const tickersNeedingProfiles = payload.predictions
     .map((prediction) => {
       const ticker = normalizeOptionalText(prediction.ticker)?.toUpperCase();
       if (!ticker) {
@@ -157,8 +168,8 @@ async function enrichPredictionPayload(payload: unknown): Promise<unknown> {
   }
 
   return {
-    ...responsePayload,
-    predictions: responsePayload.predictions.map((prediction) => {
+    ...payload,
+    predictions: payload.predictions.map((prediction) => {
       const ticker = normalizeOptionalText(prediction.ticker)?.toUpperCase();
       if (!ticker || !profiles[ticker]) {
         return prediction;
@@ -187,66 +198,157 @@ async function enrichPredictionPayload(payload: unknown): Promise<unknown> {
 }
 
 export async function POST(req: NextRequest) {
+  const session = await getServerSession(authOptions);
   const predictUrl = getPredictUrl();
+  
   if (!predictUrl) {
     return NextResponse.json(
       {
-        error:
-          "Prediction service is not configured. Set PREDICT_API_URL in frontend/.env.local.",
+        error: "Prediction service is not configured. Set PREDICT_API_URL in frontend/.env.local.",
       },
       { status: 500 },
     );
   }
 
-  let body: unknown;
+  let body: { instances?: { ticker: string }[]; tickers?: string[] };
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json(
-      { error: "Invalid request body." },
-      { status: 400 },
-    );
+    return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
   }
 
-  const headers = {
-    "Content-Type": "application/json",
-  };
+  // Support both { instances: [{ ticker: "AAPL" }] } and { tickers: ["AAPL"] } formats
+  const requestedTickers: string[] = body.instances
+    ? body.instances
+        .map((inst) => inst.ticker?.trim().toUpperCase())
+        .filter((t): t is string => Boolean(t))
+    : body.tickers ?? [];
 
+  if (requestedTickers.length === 0) {
+    return NextResponse.json({ predictions: [] });
+  }
+
+  // 1. Check for fresh snapshots in BigQuery
+  type BQSnapshot = Record<string, unknown>;
+  let freshSnapshots: BQSnapshot[] = [];
   try {
-    const upstream = await fetch(predictUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      cache: "no-store",
-    });
+    freshSnapshots = await getFreshSnapshots(requestedTickers, LIVE_SNAPSHOT_FRESH_TTL_SECONDS);
+  } catch (error) {
+    console.error("Failed to fetch fresh snapshots from BigQuery:", error);
+  }
 
-    const contentType = upstream.headers.get("content-type") ?? "";
-    const payload = contentType.includes("application/json")
-      ? await upstream.json()
-      : await upstream.text();
+  const freshTickerMap = new Map(freshSnapshots.map((s) => [s.ticker as string, s]));
+  const staleTickers = requestedTickers.filter((ticker) => !freshTickerMap.has(ticker));
 
-    if (!upstream.ok) {
-      const message = getUpstreamErrorMessage(payload, upstream.status);
-      return NextResponse.json(
-        {
-          error: message,
-          status: upstream.status,
-        },
-        { status: upstream.status },
-      );
+  const finalPredictions: PredictionPayload[] = [];
+
+  // Map fresh snapshots to the expected prediction format
+  freshSnapshots.forEach((snapshot) => {
+    let featureSnapshot: Record<string, unknown> = {};
+    if (typeof snapshot.feature_snapshot === "string") {
+      try {
+        featureSnapshot = JSON.parse(snapshot.feature_snapshot) as Record<string, unknown>;
+      } catch (e) {
+        console.error("Failed to parse cached feature_snapshot:", e);
+      }
+    } else if (snapshot.feature_snapshot && typeof snapshot.feature_snapshot === "object") {
+      featureSnapshot = snapshot.feature_snapshot as Record<string, unknown>;
     }
 
-    const enrichedPayload = await enrichPredictionPayload(payload);
-    return NextResponse.json(enrichedPayload, { status: upstream.status });
-  } catch (error: unknown) {
-    const details = error instanceof Error ? error.message : String(error);
-    return NextResponse.json(
-      {
-        error:
-          "Unable to reach the prediction service. Check your network connection, endpoint configuration, and Google Cloud access.",
-        details,
-      },
-      { status: 502 },
+    // If the snapshot is missing prediction fields, we treat it as stale so we can re-predict and enrich it
+    if (!featureSnapshot.prediction) {
+      freshTickerMap.delete(snapshot.ticker as string);
+      staleTickers.push(snapshot.ticker as string);
+      return;
+    }
+
+    // Unwrap BQ timestamp object { value: "…" } before computing age
+    const rawTs = snapshot.snapshot_timestamp;
+    const tsStr =
+      rawTs && typeof rawTs === "object" && "value" in rawTs
+        ? String((rawTs as { value: unknown }).value)
+        : rawTs instanceof Date
+        ? rawTs.toISOString()
+        : String(rawTs);
+    const snapshotAgeSeconds = Math.max(
+      0,
+      Math.floor((Date.now() - new Date(tsStr).getTime()) / 1000),
     );
+
+    // Override cache_status so the frontend shows "BQ cache" not "Live API"
+    const fs: Record<string, unknown> = {
+      ...featureSnapshot,
+      cache_status: {
+        source_mode: "bigquery_cache",
+        reason: "frontend_ttl_cache",
+        cache_hit: true,
+        stale_served: false,
+        quota_exhausted: false,
+        snapshot_timestamp: tsStr,
+        snapshot_age_seconds: snapshotAgeSeconds,
+        snapshot_age_minutes: Math.round((snapshotAgeSeconds / 60) * 10) / 10,
+        fresh_ttl_seconds: LIVE_SNAPSHOT_FRESH_TTL_SECONDS,
+        fresh_ttl_minutes: Math.round((LIVE_SNAPSHOT_FRESH_TTL_SECONDS / 60) * 10) / 10,
+      },
+    };
+
+    finalPredictions.push({
+      request_id: snapshot.request_id as string,
+      ticker: snapshot.ticker as string,
+      prediction: (fs.prediction as string) || "Unknown",
+      confidence: (fs.confidence as number) || 0,
+      prob_up: (fs.prob_up as number) || 0,
+      as_of: tsStr,
+      predicted_at: tsStr,
+      feature_snapshot: fs as FeatureSnapshotPayload,
+      model_artifact_uri: (snapshot.model_artifact_uri as string) ?? null,
+    });
+  });
+
+  // 2. Fetch stale tickers from FastAPI (forward in the instances format it expects)
+  if (staleTickers.length > 0) {
+    const headers = { "Content-Type": "application/json" };
+    try {
+      const upstream = await fetch(predictUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ instances: staleTickers.map((t) => ({ ticker: t })) }),
+        cache: "no-store",
+      });
+
+      if (upstream.ok) {
+        const payload = (await upstream.json()) as PredictResponsePayload;
+        const enriched = await enrichPredictionPayload(payload);
+        if (enriched.predictions) {
+          finalPredictions.push(...enriched.predictions);
+        }
+      } else {
+        const payload = await upstream.json();
+        const message = getUpstreamErrorMessage(payload, upstream.status);
+        // If some succeeded (from cache), maybe we still return what we have? 
+        // For simplicity, if FastAPI fails and we have no cache, we fail.
+        if (finalPredictions.length === 0) {
+          return NextResponse.json({ error: message, status: upstream.status }, { status: upstream.status });
+        }
+      }
+    } catch (error) {
+      console.error("FastAPI call failed:", error);
+      if (finalPredictions.length === 0) {
+        return NextResponse.json({ error: "Unable to reach prediction service." }, { status: 502 });
+      }
+    }
   }
+
+  // 3. Log results to BigQuery for authenticated users
+  const userEmail = session?.user?.email ?? null;
+  if (userEmail) {
+    // Log each prediction to user_prediction_log without blocking the response
+    Promise.all(
+      finalPredictions.map((p) => logUserPrediction(userEmail, p.request_id, p.ticker))
+    ).catch((error) => {
+      console.error("Failed to log predictions to BigQuery in background:", error);
+    });
+  }
+
+  return NextResponse.json({ predictions: finalPredictions });
 }

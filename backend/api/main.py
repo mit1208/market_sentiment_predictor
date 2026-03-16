@@ -22,8 +22,12 @@ _predictor = Predictor()
 async def lifespan(app: FastAPI):
     """Load model from GCS once when the container starts."""
     log.info("Container starting — loading model …")
-    _predictor.load()
-    log.info("Model loaded. Ready to serve.")
+    try:
+        _predictor.load()
+        log.info("Model loaded. Ready to serve.")
+    except Exception as exc:
+        log.error(f"Failed to load model during startup: {exc}")
+        log.warning("Container will start without a model. Predictions will fail until a model is loaded.")
     yield
 
 
@@ -86,5 +90,6 @@ def predict(req: PredictRequest) -> PredictResponse:
             log.exception(f"Prediction failed for ticker={inst.ticker}: {exc}")
             raise HTTPException(status_code=500, detail=f"Prediction error: {exc}")
         predictions.append(result)
+        _predictor.register_new_ticker_async(result["ticker"])
 
     return PredictResponse(predictions=predictions)

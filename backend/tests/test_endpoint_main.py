@@ -15,6 +15,9 @@ def _load_endpoint_module(monkeypatch):
         def predict(self, ticker):
             return {"ticker": ticker, "prediction": "Up"}
 
+        def register_new_ticker_async(self, ticker):
+            return None
+
     predictor_module.Predictor = DummyPredictor
     monkeypatch.setitem(sys.modules, "backend.ml.inference.predictor", predictor_module)
     sys.modules.pop("backend.api.main", None)

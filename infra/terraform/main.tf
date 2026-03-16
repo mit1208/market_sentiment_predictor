@@ -64,6 +64,7 @@ resource "google_bigquery_table" "raw_market_data" {
   }
 
   clustering = ["ticker"]
+  deletion_protection = false
 }
 
 resource "google_bigquery_table" "raw_news_data" {
@@ -77,6 +78,7 @@ resource "google_bigquery_table" "raw_news_data" {
   }
 
   clustering = ["ticker", "timestamp"]
+  deletion_protection = false
 }
 
 resource "google_bigquery_table" "engineered_features" {
@@ -90,12 +92,14 @@ resource "google_bigquery_table" "engineered_features" {
   }
 
   clustering = ["ticker"]
+  deletion_protection = false
 }
 
 resource "google_bigquery_table" "model_metadata" {
   dataset_id = google_bigquery_dataset.main.dataset_id
   table_id   = "model_metadata"
   schema     = file("${path.module}/model_metadata.json")
+  deletion_protection = false
 }
 
 resource "google_bigquery_table" "batch_inference_requests" {
@@ -109,6 +113,7 @@ resource "google_bigquery_table" "batch_inference_requests" {
   }
 
   clustering = ["status", "batch_id", "ticker"]
+  deletion_protection = false
 }
 
 resource "google_bigquery_table" "batch_inference_predictions" {
@@ -122,6 +127,21 @@ resource "google_bigquery_table" "batch_inference_predictions" {
   }
 
   clustering = ["batch_id", "ticker"]
+  deletion_protection = false
+}
+
+resource "google_bigquery_table" "user_prediction_log" {
+  dataset_id = google_bigquery_dataset.main.dataset_id
+  table_id   = "user_prediction_log"
+  schema     = file("${path.module}/user_prediction_log.json")
+
+  time_partitioning {
+    type  = "DAY"
+    field = "predicted_at"
+  }
+
+  clustering = ["user_email", "ticker"]
+  deletion_protection = false
 }
 
 # ---------------------------------------------------------------------------

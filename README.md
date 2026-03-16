@@ -124,7 +124,77 @@ Reads the prepared gold table only:
 - Writes artifacts to GCS and metadata to `model_metadata`
 - Promotes model to `latest.json` manifest if CV accuracy > 0.52
 
-### 6. Live Inference
+### 6. Model Versioning & Rollback
+
+Every training run saves a **versioned artifact directory** to GCS:
+
+```
+gs://{bucket}/models/market_sentiment_lgbm/{timestamp}/
+├── lgb_model.joblib
+├── xgb_model.joblib
+└── metadata.json
+```
+
+If CV accuracy clears the promotion gate (`0.52`), the job **overwrites** a single pointer file:
+
+```
+gs://{bucket}/models/market_sentiment_lgbm/latest.json
+```
+
+`latest.json` contains an `artifact_uri` pointing to the timestamped directory, plus accuracy metrics and training metadata. If accuracy does not clear the gate, `latest.json` is left untouched and the previous model continues serving.
+
+The Cloud Run prediction service polls `latest.json` every **30 seconds** (by checking the GCS blob generation number). When a new generation is detected it hot-reloads the model with zero downtime. Old versioned artifacts are never deleted, so rollback is always possible.
+
+Every run — promoted or not — is written to the BigQuery `model_metadata` table with `deployment_status = "PROMOTED"` or `"NOT_PROMOTED"` and a full `artifact_uri` pointer.
+
+**List all versions:**
+
+```sql
+SELECT
+  version,
+  training_date,
+  JSON_VALUE(performance_metrics, '$.cv_acc_mean')       AS cv_acc,
+  JSON_VALUE(performance_metrics, '$.holdout_accuracy')  AS holdout_acc,
+  JSON_VALUE(performance_metrics, '$.deployment_status') AS status,
+  JSON_VALUE(data_lineage, '$.artifact_uri')             AS artifact_uri
+FROM `mkt-sent-friend-260313-225751.market_sentiment_predictor.model_metadata`
+ORDER BY training_date DESC
+LIMIT 20;
+```
+
+**Roll back to a specific version:**
+
+```bash
+BUCKET=mkt-sent-friend-260313-225751-model-artifacts-ca1ae545
+OLD_URI="gs://$BUCKET/models/market_sentiment_lgbm/2026-03-13T20-27-24.653025+00-00"
+
+# Optional — back up the current pointer
+gsutil cp gs://$BUCKET/models/market_sentiment_lgbm/latest.json \
+          gs://$BUCKET/models/market_sentiment_lgbm/latest.json.bak
+
+# Write a new pointer to the old artifacts
+cat > /tmp/rollback_manifest.json <<EOF
+{
+  "artifact_uri": "$OLD_URI",
+  "trained_at": "2026-03-13T20:27:24+00:00"
+}
+EOF
+gsutil cp /tmp/rollback_manifest.json \
+          gs://$BUCKET/models/market_sentiment_lgbm/latest.json
+```
+
+The running Cloud Run instance detects the generation change within 30 seconds and reloads automatically. No redeployment required.
+
+**Verify the rollback:**
+
+```bash
+curl -s -X POST https://market-sentiment-predict-749244369851.us-central1.run.app/predict \
+  -H "Content-Type: application/json" \
+  -d '{"instances":[{"ticker":"AAPL"}]}' | jq '.predictions[0].model_artifact_uri'
+# → should show the rolled-back artifact URI
+```
+
+### 7. Live Inference
 
 The endpoint and batch job are the only runtime paths that call live APIs.
 

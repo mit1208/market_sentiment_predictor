@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import joblib
 import pandas as pd
@@ -56,6 +57,10 @@ FINNHUB_KEY = get_env("FINNHUB_KEY", "FINNHUB_API_KEY")
 FRED_API_KEY = get_env("FRED_API_KEY")
 LIVE_FEATURE_SNAPSHOT_TABLE = get_env("LIVE_FEATURE_SNAPSHOT_TABLE")
 
+log = logging.getLogger(__name__)
+
+_NEW_TICKER_MARKET_LOOKBACK_DAYS = 730  # 2 years of history for new tickers
+
 
 class Predictor:
     def __init__(self) -> None:
@@ -75,6 +80,8 @@ class Predictor:
         self._snapshot_cache: dict[str, tuple[float, dict]] = {}
         self._sentiment_cache: dict[str, tuple[float, dict]] = {}
         self._macro_cache: tuple[float, dict] | None = None
+        self._registered_tickers: set[str] = set()
+        self._registration_lock = threading.Lock()
 
     @property
     def storage_client(self) -> storage.Client:
@@ -115,6 +122,81 @@ class Predictor:
             project_id=PROJECT_ID or None,
             dataset_id=DATASET_ID or None,
         )
+
+    def _training_tickers_table(self) -> str:
+        return qualify_table_name(
+            "training_tickers",
+            project_id=PROJECT_ID or None,
+            dataset_id=DATASET_ID or None,
+        )
+
+    def _is_ticker_registered(self, ticker: str) -> bool:
+        try:
+            query = f"SELECT COUNT(1) AS cnt FROM `{self._training_tickers_table()}` WHERE ticker = @ticker"
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)]
+            )
+            rows = list(self.bq.query(query, job_config=job_config).result())
+            return bool(rows and rows[0].cnt > 0)
+        except Exception as exc:
+            log.warning("Failed to check training_tickers for %s: %s", ticker, exc)
+            return True
+
+    def _ingest_bronze_for_ticker(self, ticker: str) -> None:
+        from backend.ingestion.main import (
+            fetch_market_data_df,
+            fetch_news_data_df,
+            load_with_merge,
+        )
+        start_date = datetime.now(timezone.utc) - timedelta(days=_NEW_TICKER_MARKET_LOOKBACK_DAYS)
+        market_df = fetch_market_data_df([ticker], bootstrap=False, start_date_override=start_date)
+        if not market_df.empty:
+            load_with_merge(market_df, "raw_market_data", ["date", "ticker"])
+            log.info("Bronze market: %d rows ingested for %s", len(market_df), ticker)
+        news_df = fetch_news_data_df([ticker], bootstrap=False)
+        if not news_df.empty:
+            load_with_merge(news_df, "raw_news_data", ["url", "ticker"])
+            log.info("Bronze news: %d rows ingested for %s", len(news_df), ticker)
+
+    def _register_new_ticker(self, ticker: str) -> None:
+        with self._registration_lock:
+            if ticker in self._registered_tickers:
+                return
+            self._registered_tickers.add(ticker)
+
+        if self._is_ticker_registered(ticker):
+            log.debug("Ticker %s already in training_tickers, skipping registration.", ticker)
+            return
+
+        log.info("New ticker detected: %s — registering in training_tickers and ingesting bronze data.", ticker)
+        try:
+            row = {
+                "ticker": ticker,
+                "sector": "Unknown",
+                "is_active": True,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            errors = self.bq.insert_rows_json(self._training_tickers_table(), [row])
+            if errors:
+                log.warning("Failed to insert %s into training_tickers: %s", ticker, errors[:2])
+                return
+            log.info("Registered %s in training_tickers.", ticker)
+            self._ingest_bronze_for_ticker(ticker)
+            log.info(
+                "Bronze ingestion complete for %s. Run 'make submit-feature-ranking' to update silver.",
+                ticker,
+            )
+        except Exception as exc:
+            log.exception("Failed to register/ingest ticker %s: %s", ticker, exc)
+
+    def register_new_ticker_async(self, ticker: str) -> None:
+        thread = threading.Thread(
+            target=self._register_new_ticker,
+            args=(ticker,),
+            daemon=True,
+            name=f"register-{ticker}",
+        )
+        thread.start()
 
     def _split_gcs_uri(self, uri: str) -> tuple[str, str]:
         without_scheme = uri.removeprefix("gs://")
@@ -323,6 +405,19 @@ class Predictor:
                     "reason": CACHE_REASON_CACHE_FEATURE_MISMATCH,
                 },
             }
+
+        # Ensure the cached snapshot has prediction results before reusing.
+        # If it doesn't, we force a live refresh to re-enrich the data.
+        if not feature_snapshot.get("prediction"):
+            return None, daily_live_fetch_count, {
+                "cached_snapshot": cached_snapshot,
+                "reuse_decision": {
+                    **reuse_decision,
+                    "reason": "missing_prediction_metadata",
+                    "should_use_cache": False,
+                },
+            }
+
         return (
             {
                 "candidate_row": candidate_row,
@@ -419,13 +514,22 @@ class Predictor:
         probability = blend_positive_class_scores(lgb_proba, xgb_proba, metadata=self._metadata)
         label, confidence, _threshold = classify_probability(probability, metadata=self._metadata)
 
-        predicted_at = datetime.now(timezone.utc).isoformat()
+        # Embed prediction results into the feature_snapshot metadata for better caching/history
+        feature_snapshot["prediction"] = label
+        feature_snapshot["confidence"] = round(float(confidence), 4)
+        feature_snapshot["prob_up"] = round(float(probability), 4)
+
+        predicted_at_ts = datetime.now(timezone.utc)
+        predicted_at = predicted_at_ts.isoformat()
         request_id = build_snapshot_id("req", normalized_ticker, predicted_at)
+        
+        # Use single consistent timestamp for the snapshot record to avoid non-deterministic order
         snapshot_id = build_snapshot_id(
             "onlinecache" if snapshot_source == SNAPSHOT_SOURCE_ENDPOINT_CACHE else "online",
             normalized_ticker,
-            predicted_at if snapshot_source == SNAPSHOT_SOURCE_ENDPOINT_CACHE else snapshot_timestamp,
+            predicted_at_ts if snapshot_source == SNAPSHOT_SOURCE_ENDPOINT_CACHE else snapshot_timestamp,
         )
+
         headlines_text = feature_snapshot.get("headlines_text") or " ".join(
             item.get("headline", "") for item in feature_snapshot.get("news_items", [])
         ).strip()
@@ -444,7 +548,7 @@ class Predictor:
         )
         self._write_snapshot_row(snapshot_row)
 
-        return {
+        result = {
             "request_id": request_id,
             "ticker": normalized_ticker,
             "prediction": label,
@@ -457,3 +561,11 @@ class Predictor:
             "model_quality": self.model_quality,
             "feature_snapshot": feature_snapshot,
         }
+
+        # Final sanity check: ensure feature_snapshot has the predicted results
+        # This acts as a defensive measure against any accidental mutations or shadowing
+        result["feature_snapshot"]["prediction"] = label
+        result["feature_snapshot"]["confidence"] = round(confidence, 4)
+        result["feature_snapshot"]["prob_up"] = round(probability, 4)
+
+        return result
