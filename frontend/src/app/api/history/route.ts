@@ -12,6 +12,26 @@ interface ParsedFeatureSnapshot {
   [key: string]: unknown;
 }
 
+function normalizeTimestamp(value: unknown): string | null {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && "value" in value) {
+    const raw = (value as { value?: unknown }).value;
+    if (typeof raw === "string") return raw;
+  }
+  return null;
+}
+
+function getHistoryTimestampMs(row: Record<string, unknown>): number {
+  const predictedAt = normalizeTimestamp(row.predicted_at);
+  const snapshotAt = normalizeTimestamp(row.snapshot_timestamp);
+  const candidate = predictedAt ?? snapshotAt;
+  if (!candidate) return 0;
+  const ms = new Date(candidate).getTime();
+  return Number.isNaN(ms) ? 0 : ms;
+}
+
 export async function GET(_req: NextRequest) {
   const session = await getServerSession(authOptions);
 
@@ -37,16 +57,35 @@ export async function GET(_req: NextRequest) {
         featureSnapshot = raw as ParsedFeatureSnapshot;
       }
       
+      const predictedAt = normalizeTimestamp(row.predicted_at);
+      const snapshotAt = normalizeTimestamp(row.snapshot_timestamp);
+
       return {
         ...row,
         feature_snapshot: featureSnapshot,
+        predicted_at: predictedAt,
+        snapshot_timestamp: snapshotAt,
         prediction: featureSnapshot.prediction || "Unknown",
         confidence: featureSnapshot.confidence || 0,
         prob_up: featureSnapshot.prob_up || 0,
       };
     });
 
-    return NextResponse.json({ history: formattedHistory });
+    const dedupedHistory = new Map<string, Record<string, unknown>>();
+    for (const row of formattedHistory) {
+      const ticker = String(row.ticker ?? "");
+      if (!ticker) continue;
+      const existing = dedupedHistory.get(ticker);
+      if (!existing || getHistoryTimestampMs(row) > getHistoryTimestampMs(existing)) {
+        dedupedHistory.set(ticker, row);
+      }
+    }
+
+    const orderedHistory = Array.from(dedupedHistory.values())
+      .sort((a, b) => getHistoryTimestampMs(b) - getHistoryTimestampMs(a))
+      .slice(0, 50);
+
+    return NextResponse.json({ history: orderedHistory });
   } catch (error) {
     console.error("Failed to fetch user history:", error);
     return NextResponse.json({ error: "Failed to fetch history" }, { status: 500 });

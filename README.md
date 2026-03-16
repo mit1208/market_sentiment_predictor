@@ -283,7 +283,7 @@ Project root `.env` should include:
 
 ```bash
 FINNHUB_KEY=your_finnhub_key
-FRED_API_KEY=your_fred_key
+FRED_API_KEY=your_fred_key  # required for live macro features (FRED)
 FEATURE_RANK_NOTIFICATION_WEBHOOK=https://hooks.example.internal/market-sentiment  # optional
 LIVE_SNAPSHOT_FRESH_TTL_SECONDS=3600
 LIVE_SNAPSHOT_MAX_STALE_TTL_SECONDS=21600
