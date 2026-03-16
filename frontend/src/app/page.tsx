@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -22,6 +22,7 @@ import {
   Newspaper,
   Plus,
   Search,
+  Shield,
   Sparkles,
   TrendingDown,
   TrendingUp,
@@ -132,6 +133,8 @@ interface PredictionResult {
 
 type SourceFilter = "all" | "finnhub" | "yahoo" | "derived";
 type SortMode = "group" | "value" | "source";
+type Exchange = "NYSE" | "TSX";
+const DEFAULT_TICKERS: string[] = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"];
 
 interface HistoryItem {
   request_id: string;
@@ -142,6 +145,7 @@ interface HistoryItem {
   current_price: number | null;
   headline_count: number | null;
   predicted_at: string;
+  snapshot_timestamp?: string | null;
   feature_snapshot: Record<string, unknown>;
   model_artifact_uri?: string | null;
 }
@@ -273,12 +277,12 @@ function formatSignedPercent(value: number | null): string {
 
 function formatClock(value?: string | null): string {
   if (!value) {
-    return "Unknown time";
+    return "Pending";
   }
 
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
-    return "Unknown time";
+    return "Pending";
   }
 
   return date.toLocaleString([], {
@@ -291,13 +295,13 @@ function formatClock(value?: string | null): string {
 
 function formatRelativeTime(value: string | null | undefined, nowMs: number): string {
   if (!value) {
-    return "Unknown time";
+    return "Pending";
   }
 
   const date = new Date(value);
   const targetMs = date.getTime();
   if (Number.isNaN(targetMs)) {
-    return "Unknown time";
+    return "Pending";
   }
 
   const diffSeconds = Math.round((targetMs - nowMs) / 1000);
@@ -425,7 +429,7 @@ function getHeadlineSentimentTone(item: NewsItem) {
   if ((score !== null && score >= 0.05) || label === "positive") {
     return {
       label: "Positive",
-      scoreLabel: score === null ? "n/a" : score.toFixed(2),
+      scoreLabel: score === null ? "—" : score.toFixed(2),
       chipClasses: "border-emerald-200 bg-emerald-50 text-emerald-700",
       cardClasses: "border-emerald-200/80 bg-emerald-50/35 hover:border-emerald-300 hover:bg-emerald-50/55",
       scoreClasses: "text-emerald-700",
@@ -435,7 +439,7 @@ function getHeadlineSentimentTone(item: NewsItem) {
   if ((score !== null && score <= -0.05) || label === "negative") {
     return {
       label: "Negative",
-      scoreLabel: score === null ? "n/a" : score.toFixed(2),
+      scoreLabel: score === null ? "—" : score.toFixed(2),
       chipClasses: "border-rose-200 bg-rose-50 text-rose-700",
       cardClasses: "border-rose-200/80 bg-rose-50/35 hover:border-rose-300 hover:bg-rose-50/55",
       scoreClasses: "text-rose-700",
@@ -444,7 +448,7 @@ function getHeadlineSentimentTone(item: NewsItem) {
 
   return {
     label: "Neutral",
-    scoreLabel: score === null ? "n/a" : score.toFixed(2),
+    scoreLabel: score === null ? "—" : score.toFixed(2),
     chipClasses: "border-amber-200 bg-amber-50 text-amber-800",
     cardClasses: "border-amber-200/80 bg-amber-50/35 hover:border-amber-300 hover:bg-amber-50/55",
     scoreClasses: "text-amber-800",
@@ -454,7 +458,7 @@ function getHeadlineSentimentTone(item: NewsItem) {
 function getCacheTone(cacheStatus: CacheStatus | null | undefined) {
   if (!cacheStatus) {
     return {
-      label: "Mode n/a",
+      label: "Mode pending",
       chipClasses: "border-slate-200 bg-slate-100 text-slate-700",
       summary: "No cache metadata was returned for this snapshot.",
     };
@@ -608,7 +612,7 @@ function TopDriverCards({
             <div className={clsx("mt-4 text-2xl font-semibold", getFeatureValueTone(feature))}>
               {formatFeatureValue(feature)}
             </div>
-            <p className="mt-2 text-xs text-slate-500">{feature.raw_fields.join(", ") || "n/a"}</p>
+            <p className="mt-2 text-xs text-slate-500">{feature.raw_fields.join(", ") || "—"}</p>
           </div>
         ))}
       </div>
@@ -780,13 +784,13 @@ function FeatureWorkbench({
                 <span className="font-semibold uppercase tracking-[0.16em] text-slate-400">
                   providers
                 </span>{" "}
-                {feature.providers.join(" • ") || "n/a"}
+                {feature.providers.join(" • ") || "—"}
               </p>
               <p>
                 <span className="font-semibold uppercase tracking-[0.16em] text-slate-400">
                   raw fields
                 </span>{" "}
-                {feature.raw_fields.join(", ") || "n/a"}
+                {feature.raw_fields.join(", ") || "—"}
               </p>
             </div>
           </motion.div>
@@ -923,11 +927,11 @@ function PriceChart({
   }
 
   const W = 900;
-  const H = 220;
-  const padL = 62;
-  const padR = 18;
-  const padT = 16;
-  const padB = 36;
+  const H = 320;
+  const padL = 70;
+  const padR = 24;
+  const padT = 18;
+  const padB = 52;
   const innerW = W - padL - padR;
   const innerH = H - padT - padB;
 
@@ -955,7 +959,7 @@ function PriceChart({
   const yStep = priceRange / yTicks;
   const yTickValues = Array.from({ length: yTicks + 1 }, (_, i) => minPrice + i * yStep);
 
-  const xTickCount = Math.min(6, points.length);
+  const xTickCount = Math.min(7, points.length);
   const xTickIndices = Array.from({ length: xTickCount }, (_, i) =>
     Math.round((i / (xTickCount - 1)) * (points.length - 1)),
   );
@@ -966,6 +970,7 @@ function PriceChart({
 
   const formatPrice = (v: number) =>
     currency === "USD" || !currency ? `$${v.toFixed(2)}` : `${v.toFixed(2)} ${currency}`;
+  const yUnit = currency ? currency.toUpperCase() : "USD";
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -1009,6 +1014,18 @@ function PriceChart({
           </clipPath>
         </defs>
 
+        <text
+          x={12}
+          y={padT + innerH / 2}
+          textAnchor="middle"
+          fontSize="10"
+          fill="#94a3b8"
+          fontFamily="ui-sans-serif, sans-serif"
+          transform={`rotate(-90 12 ${padT + innerH / 2})`}
+        >
+          {yUnit}
+        </text>
+
         {yTickValues.map((val) => (
           <g key={val}>
             <line
@@ -1027,7 +1044,11 @@ function PriceChart({
               fill="#94a3b8"
               fontFamily="ui-monospace, monospace"
             >
-              {val >= 1000 ? `${(val / 1000).toFixed(1)}k` : val.toFixed(1)}
+              {currency === "USD" || !currency
+                ? `$${val >= 1000 ? `${(val / 1000).toFixed(1)}k` : val.toFixed(1)}`
+                : val >= 1000
+                  ? `${(val / 1000).toFixed(1)}k ${currency}`
+                  : `${val.toFixed(1)} ${currency}`}
             </text>
           </g>
         ))}
@@ -1036,13 +1057,15 @@ function PriceChart({
           <text
             key={idx}
             x={xOf(idx)}
-            y={padT + innerH + 20}
+            y={padT + innerH + 24}
             textAnchor="middle"
             fontSize="10"
             fill="#94a3b8"
             fontFamily="ui-sans-serif, sans-serif"
           >
-            {points[idx].date.slice(5)}
+            {points[idx].date
+              ? new Date(points[idx].date).toLocaleDateString("en-US", { month: "short", year: "2-digit" })
+              : ""}
           </text>
         ))}
 
@@ -1128,7 +1151,8 @@ function PriceChart({
 export default function Home() {
   const { data: session } = useSession();
   const [ticker, setTicker] = useState("");
-  const [tickers, setTickers] = useState<string[]>([]);
+  const [tickers, setTickers] = useState<string[]>(DEFAULT_TICKERS);
+  const [exchange, setExchange] = useState<Exchange>("NYSE");
   const [results, setResults] = useState<PredictionResult[]>([]);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -1145,6 +1169,7 @@ export default function Home() {
   const [chartCurrency, setChartCurrency] = useState<string | null>(null);
   const [chartTicker, setChartTicker] = useState<string | null>(null);
   const [chartLoading, setChartLoading] = useState(false);
+  const autoBootstrapped = useRef(false);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 15000);
@@ -1174,7 +1199,7 @@ export default function Home() {
           setChartTicker(ticker);
         }
       })
-      .catch(() => {})
+      .catch(() => { })
       .finally(() => setChartLoading(false));
   }, [selectedTicker]);
 
@@ -1195,7 +1220,7 @@ export default function Home() {
 
   useEffect(() => {
     if (results.length === 0) {
-      setSelectedTicker(null);
+      setSelectedTicker((current) => current ?? tickers[0] ?? null);
       return;
     }
 
@@ -1205,7 +1230,16 @@ export default function Home() {
       }
       return results[0]?.ticker ?? null;
     });
-  }, [results]);
+  }, [results, tickers]);
+
+  useEffect(() => {
+    if (autoBootstrapped.current) return;
+    if (loading) return;
+    if (results.length > 0) return;
+    if (tickers.length === 0) return;
+    autoBootstrapped.current = true;
+    predict();
+  }, [loading, results.length, tickers.length]);
 
   const activeResult =
     results.find((result) => result.ticker === selectedTicker) ?? results[0] ?? null;
@@ -1283,13 +1317,41 @@ export default function Home() {
     : 0;
   const topDriverFeatures = activeResult
     ? (activeResult.model_quality?.top_features ?? [])
-        .map((row) => getFeature(activeResult, row.feature))
-        .filter((feature): feature is FeatureRow => Boolean(feature))
+      .map((row) => getFeature(activeResult, row.feature))
+      .filter((feature): feature is FeatureRow => Boolean(feature))
     : [];
   const newsTone = getNewsTone(sentimentScore, headlineCount);
+  const hasFredMacro =
+    !!activeResult &&
+    flattenFeatures(activeResult.feature_snapshot.groups).some(
+      (feature) => feature.source === "fred" || feature.providers.includes("fred"),
+    );
+  const normalizeTickerInput = (raw: string, market: Exchange) => {
+    const normalized = raw.trim().toUpperCase();
+    if (!normalized) return "";
+    if (market === "TSX") {
+      if (normalized.includes(".")) return normalized;
+      return `${normalized}.TO`;
+    }
+    return normalized;
+  };
+  const historySourceLabel = (item: HistoryItem) => {
+    const cacheStatus = (item.feature_snapshot as { cache_status?: CacheStatus | null })?.cache_status;
+    if (cacheStatus?.source_mode === "live_api") return "Live API";
+    if (cacheStatus?.source_mode === "bigquery_cache") return "BQ cache";
+    return "Pending";
+  };
+  const historySnapshotAge = (item: HistoryItem) => {
+    const cacheStatus = (item.feature_snapshot as { cache_status?: CacheStatus | null })?.cache_status;
+    if (cacheStatus?.snapshot_age_minutes !== undefined && cacheStatus?.snapshot_age_minutes !== null) {
+      return `${cacheStatus.snapshot_age_minutes.toFixed(1)}m`;
+    }
+    const baseTs = item.snapshot_timestamp ?? item.predicted_at;
+    return baseTs ? formatRelativeTime(baseTs, nowMs) : "Pending";
+  };
 
   function addTicker() {
-    const normalized = ticker.trim().toUpperCase();
+    const normalized = normalizeTickerInput(ticker, exchange);
     if (!normalized || tickers.includes(normalized)) {
       setTicker("");
       return;
@@ -1403,107 +1465,40 @@ export default function Home() {
             </div>
           </div>
 
-          {session && (
-            <div className="mt-5 rounded-[36px] border border-white/70 bg-white/75 p-6 shadow-[0_28px_90px_-52px_rgba(15,23,42,0.3)] backdrop-blur">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-                    <History className="h-4 w-4 text-slate-500" />
-                    Your prediction history
-                  </div>
-                  <p className="mt-2 text-sm text-slate-600">
-                    Showing your last 50 predictions linked to your account.
-                  </p>
-                </div>
-                {loadingHistory && <Loader2 className="h-4 w-4 animate-spin text-slate-400" />}
-              </div>
-
-              <div className="mt-6 overflow-hidden rounded-[24px] border border-slate-200/60 bg-white/50">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-sm">
-                    <thead className="bg-slate-50/80 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
-                      <tr>
-                        <th className="px-6 py-4">Ticker</th>
-                        <th className="px-6 py-4">Prediction</th>
-                        <th className="px-6 py-4">Prob</th>
-                        <th className="px-6 py-4">Price</th>
-                        <th className="px-6 py-4">News</th>
-                        <th className="px-6 py-4 text-right">Date</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100/60">
-                      {history.length > 0 ? (
-                        history.map((item, idx) => (
-                          <tr key={`${item.request_id}-${idx}`} className="group hover:bg-slate-50/40">
-                            <td className="px-6 py-4 font-semibold text-slate-900">
-                              {item.ticker}
-                            </td>
-                            <td className="px-6 py-4">
-                              <span className={clsx(
-                                "rounded-full px-3 py-1 text-[11px] font-semibold",
-                                item.prediction === "Up" ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"
-                              )}>
-                                {item.prediction}
-                              </span>
-                            </td>
-                            <td className="px-6 py-4 tabular-nums text-slate-600">
-                              {(item.prob_up * 100).toFixed(1)}%
-                            </td>
-                            <td className="px-6 py-4 tabular-nums text-slate-600">
-                              {formatQuotedPrice(item.current_price)}
-                            </td>
-                            <td className="px-6 py-4 text-slate-500">
-                              {item.headline_count} headlines
-                            </td>
-                            <td className="px-6 py-4 text-right tabular-nums text-slate-400">
-                              {formatClock(item.predicted_at)}
-                            </td>
-                          </tr>
-                        ))
-                      ) : (
-                        <tr>
-                          <td colSpan={6} className="px-6 py-12 text-center text-slate-400">
-                            {loadingHistory ? "Loading your history..." : "No prediction history found yet. Run a prediction to get started."}
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-          )}
-
           <div className="mt-8 grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
             <div className="rounded-[36px] border border-white/70 bg-white/75 p-6 shadow-[0_28px_90px_-52px_rgba(15,23,42,0.5)] backdrop-blur">
               <div className="flex items-start justify-between gap-6">
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">
-                    Live Prediction Desk
+                    Market Intelligence Terminal
                   </p>
                   <h1 className="mt-3 max-w-3xl text-4xl font-semibold tracking-[-0.04em] text-slate-950 sm:text-5xl">
-                    Real-time ticker intelligence for live market snapshots.
+                    Institutional-grade signals from live market, news, and macro data.
                   </h1>
                   <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-600 sm:text-base">
-                    Queue one or more tickers, request a fresh snapshot, then inspect
-                    the prediction, market context, and the signals driving the readout.
+                    Your default market universe loads automatically. Edit the ticker list to
+                    run focused scans, then review the signal board and model drivers.
                   </p>
                 </div>
                 <div className="hidden rounded-[28px] border border-slate-200/80 bg-white/90 p-4 lg:block">
                   <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
                     <Database className="h-4 w-4 text-slate-500" />
-                    Stored
+                    Active frame
                   </div>
                   <div className="mt-3 text-3xl font-semibold tracking-tight text-slate-950">
-                    50
+                    {activeResult?.feature_snapshot?.selected_feature_count ?? activeResult?.model_quality?.used_feature_count ?? "Pending"}
                   </div>
                   <p className="mt-2 max-w-[14rem] text-sm leading-6 text-slate-600">
-                    model features retained with snapshot timestamps
+                    {activeResult?.feature_snapshot?.feature_count
+                      ? `out of ${activeResult.feature_snapshot.feature_count} features selected for training`
+                      : activeResult?.model_quality?.used_feature_count
+                        ? `out of ${activeResult.model_quality.used_feature_count} features selected for training`
+                        : "Auto-scoring default universe. Features align with gold training contract."}
                   </p>
                 </div>
               </div>
 
-              <div className="mt-8 grid gap-4 xl:grid-cols-[1fr_auto_auto]">
+              <div className="mt-8 grid gap-4 xl:grid-cols-[1fr_auto_auto_auto]">
                 <label className="rounded-[28px] border border-slate-200/80 bg-white px-4 py-4 shadow-inner shadow-slate-100">
                   <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
                     Ticker
@@ -1519,11 +1514,28 @@ export default function Home() {
                           addTicker();
                         }
                       }}
-                      placeholder="AAPL"
+                      placeholder={exchange === "TSX" ? "RY" : "AAPL"}
                       className="w-full bg-transparent text-lg font-semibold uppercase tracking-[0.14em] text-slate-950 outline-none placeholder:text-slate-300"
                     />
                   </div>
                 </label>
+
+                <div className="rounded-[28px] border border-slate-200/80 bg-white px-4 py-4 shadow-inner shadow-slate-100">
+                  <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    Market
+                  </span>
+                  <div className="mt-2 flex items-center gap-3">
+                    <Filter className="h-5 w-5 text-slate-400" />
+                    <select
+                      value={exchange}
+                      onChange={(event) => setExchange(event.target.value as Exchange)}
+                      className="w-full bg-transparent text-sm font-semibold uppercase tracking-[0.18em] text-slate-900 outline-none"
+                    >
+                      <option value="NYSE">NYSE</option>
+                      <option value="TSX">TSX</option>
+                    </select>
+                  </div>
+                </div>
 
                 <button
                   onClick={addTicker}
@@ -1553,10 +1565,16 @@ export default function Home() {
                 </button>
               </div>
 
+              {!session && (
+                <div className="mt-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                  Predictions don’t require login. Sign in only to save history.
+                </div>
+              )}
+
               <div className="mt-5 flex flex-wrap gap-2">
                 {tickers.length === 0 ? (
                   <div className="rounded-full border border-dashed border-slate-300 px-3 py-1.5 text-sm text-slate-500">
-                    No tickers queued yet
+                    Default universe ready
                   </div>
                 ) : (
                   tickers.map((tickerItem) => (
@@ -1592,8 +1610,8 @@ export default function Home() {
             <div className="rounded-[36px] border border-white/70 bg-[linear-gradient(150deg,rgba(255,255,255,0.92),rgba(255,255,255,0.72))] p-6 shadow-[0_28px_90px_-52px_rgba(15,23,42,0.5)] backdrop-blur">
               {activeResult ? (
                 <>
-                  <div className="flex items-center justify-between gap-4">
-                    <div>
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="min-w-0 flex-1">
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
                         Active ticker
                       </p>
@@ -1602,7 +1620,7 @@ export default function Home() {
                           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
                           <span className="relative inline-flex h-3 w-3 rounded-full bg-emerald-500" />
                         </div>
-                        <div>
+                        <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-slate-600">
                               {activeResult.ticker}
@@ -1613,18 +1631,13 @@ export default function Home() {
                               </span>
                             )}
                           </div>
-                          <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-950">
-                            {companyName ?? activeResult.ticker}
+                          <h2 className="mt-3 text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
+                            {companyName ? `${companyName} (${activeResult.ticker})` : activeResult.ticker}
                           </h2>
-                          {companyName && (
-                            <p className="mt-1 text-sm text-slate-500">
-                              Full company name for {activeResult.ticker}
-                            </p>
-                          )}
                         </div>
                       </div>
                     </div>
-                    <div className="flex flex-wrap items-center justify-end gap-2">
+                    <div className="w-full flex flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
                       <div
                         className={clsx(
                           "rounded-full bg-gradient-to-r px-4 py-2 text-sm font-semibold",
@@ -1649,19 +1662,35 @@ export default function Home() {
                       >
                         {cacheTone.label}
                       </div>
+                      <div className="flex flex-wrap items-center gap-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                        <span className="rounded-full border border-slate-200 bg-white px-2 py-1">
+                          source {cacheStatus?.source_mode === "live_api" ? "Live API" : cacheStatus?.source_mode === "bigquery_cache" ? "BQ cache" : "Pending"}
+                        </span>
+                        <span className="rounded-full border border-slate-200 bg-white px-2 py-1">
+                          age {cacheStatus?.snapshot_age_minutes !== undefined && cacheStatus?.snapshot_age_minutes !== null
+                            ? `${cacheStatus.snapshot_age_minutes.toFixed(1)}m`
+                            : formatRelativeTime(activeResult.as_of, nowMs)}
+                          {cacheStatus?.fresh_ttl_minutes !== undefined && cacheStatus?.fresh_ttl_minutes !== null
+                            ? ` / ttl ${cacheStatus.fresh_ttl_minutes.toFixed(0)}m`
+                            : ""}
+                        </span>
+                        <span className="rounded-full border border-slate-200 bg-white px-2 py-1">
+                          request {activeResult.request_id}
+                        </span>
+                      </div>
                     </div>
                   </div>
 
-                    <div className="mt-6 rounded-[30px] border border-slate-200/80 bg-slate-950 p-5 text-white">
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-white/60">
-                          <Gauge className="h-4 w-4" />
+                  <div className="mt-6 rounded-[30px] border border-slate-200/80 bg-slate-950 p-5 text-white">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-white/60">
+                        <Gauge className="h-4 w-4" />
                         Up probability
-                        </div>
-                        <span className="text-sm text-white/70">
-                        {activeResult.prediction === "Up" ? "above 50% = Up" : "below 50% = Down"}
-                        </span>
                       </div>
+                      <span className="text-sm text-white/70">
+                        {activeResult.prediction === "Up" ? "above 50% = Up" : "below 50% = Down"}
+                      </span>
+                    </div>
                     <div className="mt-5">
                       <div className="flex items-end justify-between">
                         <div className="text-5xl font-semibold tracking-tight">
@@ -1774,6 +1803,88 @@ export default function Home() {
             </div>
           )}
 
+          {session && (
+            <div className="mt-6 rounded-[36px] border border-white/70 bg-white/75 p-6 shadow-[0_28px_90px_-52px_rgba(15,23,42,0.3)] backdrop-blur">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                    <History className="h-4 w-4 text-slate-500" />
+                    Your prediction history
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Showing your last 50 predictions linked to your account.
+                  </p>
+                </div>
+                {loadingHistory && <Loader2 className="h-4 w-4 animate-spin text-slate-400" />}
+              </div>
+
+              <div className="mt-6 overflow-hidden rounded-[24px] border border-slate-200/60 bg-white/50">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-slate-50/80 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
+                      <tr>
+                        <th className="px-6 py-4">Ticker</th>
+                        <th className="px-6 py-4">Prediction</th>
+                        <th className="px-6 py-4">Prob</th>
+                        <th className="px-6 py-4">Price</th>
+                        <th className="px-6 py-4">News</th>
+                        <th className="px-6 py-4">Source</th>
+                        <th className="px-6 py-4 text-right">Date</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100/60">
+                      {history.length > 0 ? (
+                        history.map((item, idx) => (
+                          <tr key={`${item.request_id}-${idx}`} className="group hover:bg-slate-50/40">
+                            <td className="px-6 py-4 font-semibold text-slate-900">
+                              {item.ticker}
+                            </td>
+                            <td className="px-6 py-4">
+                              <span className={clsx(
+                                "rounded-full px-3 py-1 text-[11px] font-semibold",
+                                item.prediction === "Up" ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"
+                              )}>
+                                {item.prediction}
+                              </span>
+                            </td>
+                            <td className="px-6 py-4 tabular-nums text-slate-600">
+                              {(item.prob_up * 100).toFixed(1)}%
+                            </td>
+                            <td className="px-6 py-4 tabular-nums text-slate-600">
+                              {formatQuotedPrice(item.current_price)}
+                            </td>
+                            <td className="px-6 py-4 text-slate-500">
+                              {item.headline_count} headlines
+                            </td>
+                            <td className="px-6 py-4 text-slate-500">
+                              <div className="flex flex-col">
+                                <span className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                                  {historySourceLabel(item)}
+                                </span>
+                                <span className="text-xs text-slate-400">
+                                  {historySnapshotAge(item)}
+                                </span>
+                              </div>
+                            </td>
+                            <td className="px-6 py-4 text-right tabular-nums text-slate-400">
+                              {formatClock(item.predicted_at)}
+                            </td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={7} className="px-6 py-12 text-center text-slate-400">
+                            {loadingHistory ? "Loading your history..." : "History will appear after your first prediction."}
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
           {results.length > 0 && activeResult && (
             <div className="mt-6">
               <div className="flex flex-wrap gap-2">
@@ -1837,7 +1948,7 @@ export default function Home() {
                         detail={
                           vixLevel !== null
                             ? `VIX ${formatFeatureValue({ name: "vix_level", value: vixLevel })}`
-                            : "VIX n/a"
+                            : "VIX —"
                         }
                         accent={
                           spyChangePct !== null && spyChangePct >= 0
@@ -1851,7 +1962,7 @@ export default function Home() {
                         value={
                           volumeVsAvg10d !== null
                             ? formatFeatureValue({ name: "volume_vs_avg_10d", value: volumeVsAvg10d })
-                            : "n/a"
+                            : "—"
                         }
                         detail={
                           priceVs50d !== null
@@ -1869,8 +1980,8 @@ export default function Home() {
                         label="Data mode"
                         value={cacheTone.label}
                         detail={
-                          cacheStatus
-                            ? `${cacheTone.summary} Age ${cacheStatus.snapshot_age_minutes ?? "n/a"}m. Remaining live budget ${cacheStatus.daily_live_fetch_remaining ?? "n/a"}/${cacheStatus.daily_live_fetch_limit ?? "n/a"}.`
+                          cacheStatus?.snapshot_age_minutes !== undefined && cacheStatus?.snapshot_age_minutes !== null
+                            ? `${cacheTone.summary} Age ${cacheStatus.snapshot_age_minutes.toFixed(1)}m${cacheStatus?.fresh_ttl_minutes !== undefined && cacheStatus?.fresh_ttl_minutes !== null ? ` · TTL ${cacheStatus.fresh_ttl_minutes.toFixed(0)}m` : ""}.`
                             : cacheTone.summary
                         }
                         accent={
@@ -1879,20 +1990,6 @@ export default function Home() {
                             : cacheStatus?.stale_served
                               ? "text-amber-800"
                               : "text-indigo-700"
-                        }
-                      />
-                      <MetricCard
-                        icon={<Clock3 className="h-4 w-4 text-slate-500" />}
-                        label="News input"
-                        value={
-                          headlineCount !== null
-                            ? `${headlineCount.toLocaleString()} raw`
-                            : "n/a"
-                        }
-                        detail={
-                          avgNewsAgeHours !== null
-                            ? `${uniqueNewsCount} unique shown, avg age ${avgNewsAgeHours.toFixed(1)}h`
-                            : `${uniqueNewsCount} unique shown`
                         }
                       />
                     </div>
@@ -1906,7 +2003,7 @@ export default function Home() {
                       </div>
                       <div className="mt-4">
                         {chartLoading ? (
-                          <div className="flex h-48 items-center justify-center gap-2 text-sm text-slate-400">
+                          <div className="flex h-72 items-center justify-center gap-2 text-sm text-slate-400">
                             <Loader2 className="h-4 w-4 animate-spin" />
                             Loading chart…
                           </div>
@@ -1918,7 +2015,7 @@ export default function Home() {
                             prediction={activeResult.prediction}
                           />
                         ) : (
-                          <div className="flex h-48 items-center justify-center text-sm text-slate-400">
+                          <div className="flex h-72 items-center justify-center text-sm text-slate-400">
                             Chart unavailable
                           </div>
                         )}
@@ -2004,14 +2101,19 @@ export default function Home() {
                           </p>
                           <p className="mt-2 text-2xl font-semibold text-slate-950">
                             {cacheStatus?.snapshot_age_minutes !== undefined &&
-                            cacheStatus?.snapshot_age_minutes !== null
+                              cacheStatus?.snapshot_age_minutes !== null
                               ? `${cacheStatus.snapshot_age_minutes.toFixed(1)}m old`
-                              : "n/a"}
+                              : "Freshness pending"}
                           </p>
                           <p className="mt-1 text-xs text-slate-500">
                             {cacheStatus
-                              ? `${cacheStatus.daily_live_fetch_count ?? "n/a"} of ${cacheStatus.daily_live_fetch_limit ?? "n/a"} live fetches used today for this ticker`
-                              : "No live-cache telemetry available"}
+                              ? cacheStatus.daily_live_fetch_count !== null &&
+                                cacheStatus.daily_live_fetch_count !== undefined &&
+                                cacheStatus.daily_live_fetch_limit !== null &&
+                                cacheStatus.daily_live_fetch_limit !== undefined
+                                ? `${cacheStatus.daily_live_fetch_count} of ${cacheStatus.daily_live_fetch_limit} live fetches used today for this ticker`
+                                : "Live quota telemetry pending"
+                              : "Live-cache telemetry pending"}
                           </p>
                         </div>
                         <div className="rounded-[22px] bg-slate-100 px-4 py-3">
@@ -2022,7 +2124,20 @@ export default function Home() {
                             {activeResult.feature_snapshot.feature_count}
                           </p>
                           <p className="mt-1 text-xs text-slate-500">
-                            {activeResult.feature_snapshot.selected_feature_count ?? activeResult.model_quality?.used_feature_count ?? "n/a"} selected by the active model
+                            {activeResult.feature_snapshot.selected_feature_count ?? activeResult.model_quality?.used_feature_count ?? "—"} selected by the active model
+                          </p>
+                        </div>
+                        <div className="rounded-[22px] bg-slate-100 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                            provider mix
+                          </p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">
+                            {activeResult.feature_snapshot.provider_summary
+                              ? `F${activeResult.feature_snapshot.provider_summary.finnhub ?? 0} · Y${activeResult.feature_snapshot.provider_summary.yahoo ?? 0} · D${activeResult.feature_snapshot.provider_summary.derived ?? 0}`
+                              : "Pending"}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            Finnhub, Yahoo, and derived signals per snapshot
                           </p>
                         </div>
                       </div>
@@ -2077,6 +2192,122 @@ export default function Home() {
               </AnimatePresence>
             </div>
           )}
+
+          <div className="mt-10 grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
+            <div className="rounded-[36px] border border-white/70 bg-white/80 p-6 shadow-[0_24px_70px_-50px_rgba(15,23,42,0.35)] backdrop-blur">
+              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                <Shield className="h-4 w-4 text-slate-500" />
+                Trust & transparency
+              </div>
+              <h2 className="mt-3 text-2xl font-semibold tracking-tight text-slate-950">
+                Clear inputs, visible lineage, repeatable results.
+              </h2>
+              <p className="mt-3 text-sm leading-7 text-slate-600">
+                Built for financial workflows: you see source mix, freshness, and cache lineage on every run.
+              </p>
+              <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-[22px] border border-slate-200/70 bg-white/90 p-4">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    <Newspaper className="h-4 w-4 text-slate-500" />
+                    Data sources
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Three sources: Finnhub live, Yahoo fallback, BigQuery audit. Every snapshot is stamped.
+                  </p>
+                </div>
+                <div className="rounded-[22px] border border-slate-200/70 bg-white/90 p-4">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    <Clock3 className="h-4 w-4 text-slate-500" />
+                    Freshness
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Every prediction includes snapshot age, cache status, and TTL window.
+                  </p>
+                </div>
+                <div className="rounded-[22px] border border-slate-200/70 bg-white/90 p-4">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    <Database className="h-4 w-4 text-slate-500" />
+                    Audit trail
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600">
+                    BigQuery logs every request with timestamped feature snapshots for review.
+                  </p>
+                </div>
+                <div className="rounded-[22px] border border-slate-200/70 bg-white/90 p-4">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    <Brain className="h-4 w-4 text-slate-500" />
+                    Model context
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Feature groups, top drivers, and technical report links are all exposed.
+                  </p>
+                </div>
+              </div>
+              <div className="mt-5 rounded-[20px] border border-emerald-200/70 bg-emerald-50/70 px-4 py-3 text-sm text-emerald-900">
+                <span className="font-semibold">Receipts built-in:</span>{" "}
+                {activeResult
+                  ? `showing request ${activeResult.request_id} from ${formatClock(activeResult.predicted_at)}`
+                  : "run a prediction to stamp a request id and snapshot time right here"}
+              </div>
+              <p className="mt-4 text-xs uppercase tracking-[0.18em] text-slate-400">
+                We store tickers, timestamps, and model features. We never store account passwords.
+              </p>
+            </div>
+
+            <div className="rounded-[36px] border border-white/70 bg-white/75 p-6 shadow-[0_24px_70px_-50px_rgba(15,23,42,0.35)] backdrop-blur">
+              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                <Activity className="h-4 w-4 text-slate-500" />
+                Live readiness
+              </div>
+              <div className="mt-4 grid gap-3">
+                <div className="rounded-[22px] bg-slate-50 px-4 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    Snapshot cache
+                  </p>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Fresh snapshots reuse cached frames to minimize API drift and reduce noise.
+                  </p>
+                </div>
+                <div className="rounded-[22px] bg-slate-50 px-4 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    News provenance
+                  </p>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Headlines show provider, timestamp, and sentiment scoring time per item.
+                  </p>
+                </div>
+                <div className="rounded-[22px] bg-slate-50 px-4 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    Model lineage
+                  </p>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Each prediction is tagged with the model artifact URI and training snapshot.
+                  </p>
+                </div>
+                <div className="rounded-[22px] bg-slate-50 px-4 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    FRED macro
+                  </p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">
+                    {activeResult ? (hasFredMacro ? "Active" : "Offline") : "Awaiting run"}
+                  </p>
+                  <p className="mt-1 text-sm text-slate-600">
+                    {activeResult
+                      ? "Macro indicators sourced from FRED when available."
+                      : "Run a prediction to confirm macro feed status."}
+                  </p>
+                </div>
+                <div className="rounded-[22px] bg-slate-50 px-4 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    Provider mix
+                  </p>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Finnhub, Yahoo, and derived signals are tracked per snapshot for consistency.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
         </motion.div>
       </div>
     </div>

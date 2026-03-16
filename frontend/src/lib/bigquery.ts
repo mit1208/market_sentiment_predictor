@@ -62,9 +62,9 @@ export async function getUserHistory(email: string) {
       s.sentiment_score,
       s.feature_snapshot,
       s.model_artifact_uri,
-      s.request_id
+      COALESCE(s.request_id, l.request_id) AS request_id
     FROM \`${process.env.GCP_PROJECT_ID}.${datasetId}.user_prediction_log\` l
-    JOIN \`${process.env.GCP_PROJECT_ID}.${datasetId}.live_feature_snapshots\` s
+    LEFT JOIN \`${process.env.GCP_PROJECT_ID}.${datasetId}.live_feature_snapshots\` s
       ON l.request_id = s.request_id
       AND l.ticker = s.ticker
     WHERE l.user_email = @user_email
