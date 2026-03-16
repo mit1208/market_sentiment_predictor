@@ -12,6 +12,12 @@ interface ParsedFeatureSnapshot {
   [key: string]: unknown;
 }
 
+type HistoryRow = Record<string, unknown> & {
+  ticker?: string | null;
+  predicted_at?: unknown;
+  snapshot_timestamp?: unknown;
+};
+
 function normalizeTimestamp(value: unknown): string | null {
   if (!value) return null;
   if (value instanceof Date) return value.toISOString();
@@ -23,7 +29,7 @@ function normalizeTimestamp(value: unknown): string | null {
   return null;
 }
 
-function getHistoryTimestampMs(row: Record<string, unknown>): number {
+function getHistoryTimestampMs(row: HistoryRow): number {
   const predictedAt = normalizeTimestamp(row.predicted_at);
   const snapshotAt = normalizeTimestamp(row.snapshot_timestamp);
   const candidate = predictedAt ?? snapshotAt;
@@ -68,10 +74,10 @@ export async function GET(_req: NextRequest) {
         prediction: featureSnapshot.prediction || "Unknown",
         confidence: featureSnapshot.confidence || 0,
         prob_up: featureSnapshot.prob_up || 0,
-      };
-    });
+      } satisfies HistoryRow & Record<string, unknown>;
+    }) as HistoryRow[];
 
-    const dedupedHistory = new Map<string, Record<string, unknown>>();
+    const dedupedHistory = new Map<string, HistoryRow>();
     for (const row of formattedHistory) {
       const ticker = String(row.ticker ?? "");
       if (!ticker) continue;
