@@ -106,7 +106,7 @@ def build_cache_status(
     origin_request_id: str | None = None,
 ) -> dict:
     normalized_snapshot_timestamp = normalize_cache_timestamp(snapshot_timestamp)
-    consumed_live_fetches = 1 if source_mode == CACHE_SOURCE_MODE_LIVE_API else 0
+    consumed_live_fetches = 0 if cache_hit else 1
     used_live_fetch_count = daily_live_fetch_count + consumed_live_fetches
     return {
         "source_mode": source_mode,

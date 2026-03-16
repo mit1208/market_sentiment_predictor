@@ -4,7 +4,7 @@ import { ArrowLeft, Database, Gauge } from "lucide-react";
 import {
   fetchModelReliabilitySnapshot,
   type ModelReliabilitySnapshot,
-} from "@/lib/model-reliability";
+} from "../../lib/model-reliability";
 
 export const dynamic = "force-dynamic";
 

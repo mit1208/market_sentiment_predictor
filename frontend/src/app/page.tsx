@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { useSession, signIn, signOut } from "next-auth/react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Activity,
@@ -14,13 +15,17 @@ import {
   Database,
   Filter,
   Gauge,
+  History,
   Loader2,
+  LogIn,
+  LogOut,
   Newspaper,
   Plus,
   Search,
   Sparkles,
   TrendingDown,
   TrendingUp,
+  User,
   X,
 } from "lucide-react";
 import { clsx } from "clsx";
@@ -128,6 +133,19 @@ interface PredictionResult {
 type SourceFilter = "all" | "finnhub" | "yahoo" | "derived";
 type SortMode = "group" | "value" | "source";
 
+interface HistoryItem {
+  request_id: string;
+  ticker: string;
+  prediction: string;
+  prob_up: number;
+  confidence: number;
+  current_price: number | null;
+  headline_count: number | null;
+  predicted_at: string;
+  feature_snapshot: Record<string, unknown>;
+  model_artifact_uri?: string | null;
+}
+
 interface FeatureRow extends FeatureItem {
   groupKey: string;
   groupLabel: string;
@@ -182,15 +200,15 @@ function getFeature(result: PredictionResult, name: string): FeatureRow | undefi
   );
 }
 
-function getNumericFeature(result: PredictionResult, name: string): number | null {
+function getNumericFeature(result: PredictionResult, name: string): number {
   const value = getFeature(result, name)?.value;
-  return typeof value === "number" ? value : null;
+  return typeof value === "number" ? value : 0;
 }
 
 function formatFeatureValue(feature: Pick<FeatureItem, "name" | "value">): string {
   const value = feature.value;
   if (value === null || value === undefined || value === "") {
-    return "n/a";
+    return "0.00";
   }
 
   if (typeof value !== "number") {
@@ -224,7 +242,7 @@ function formatFeatureValue(feature: Pick<FeatureItem, "name" | "value">): strin
 
 function formatQuotedPrice(value: number | null, currency?: string | null): string {
   if (value === null) {
-    return "n/a";
+    return "$0.00";
   }
 
   const normalizedCurrency = currency?.trim().toUpperCase();
@@ -246,7 +264,7 @@ function formatQuotedPrice(value: number | null, currency?: string | null): stri
 
 function formatSignedPercent(value: number | null): string {
   if (value === null) {
-    return "n/a";
+    return "0.00%";
   }
 
   const prefix = value > 0 ? "+" : "";
@@ -255,12 +273,12 @@ function formatSignedPercent(value: number | null): string {
 
 function formatClock(value?: string | null): string {
   if (!value) {
-    return "n/a";
+    return "Unknown time";
   }
 
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
-    return "n/a";
+    return "Unknown time";
   }
 
   return date.toLocaleString([], {
@@ -273,13 +291,13 @@ function formatClock(value?: string | null): string {
 
 function formatRelativeTime(value: string | null | undefined, nowMs: number): string {
   if (!value) {
-    return "n/a";
+    return "Unknown time";
   }
 
   const date = new Date(value);
   const targetMs = date.getTime();
   if (Number.isNaN(targetMs)) {
-    return "n/a";
+    return "Unknown time";
   }
 
   const diffSeconds = Math.round((targetMs - nowMs) / 1000);
@@ -878,10 +896,242 @@ function NewsRail({
   );
 }
 
+interface ChartPoint {
+  date: string;
+  close: number;
+}
+
+function PriceChart({
+  points,
+  ticker,
+  currency,
+  prediction,
+}: {
+  points: ChartPoint[];
+  ticker: string;
+  currency: string | null;
+  prediction: "Up" | "Down";
+}) {
+  const [tooltip, setTooltip] = useState<{ x: number; y: number; point: ChartPoint } | null>(null);
+
+  if (points.length < 2) {
+    return (
+      <div className="flex h-48 items-center justify-center text-sm text-slate-400">
+        Not enough data to render chart
+      </div>
+    );
+  }
+
+  const W = 900;
+  const H = 220;
+  const padL = 62;
+  const padR = 18;
+  const padT = 16;
+  const padB = 36;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+
+  const prices = points.map((p) => p.close);
+  const minPrice = Math.min(...prices);
+  const maxPrice = Math.max(...prices);
+  const priceRange = maxPrice - minPrice || 1;
+
+  const xOf = (i: number) => padL + (i / (points.length - 1)) * innerW;
+  const yOf = (price: number) => padT + (1 - (price - minPrice) / priceRange) * innerH;
+
+  const pathD = points
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${xOf(i).toFixed(1)} ${yOf(p.close).toFixed(1)}`)
+    .join(" ");
+
+  const areaD =
+    pathD +
+    ` L ${xOf(points.length - 1).toFixed(1)} ${(padT + innerH).toFixed(1)} L ${padL.toFixed(1)} ${(padT + innerH).toFixed(1)} Z`;
+
+  const isUp = prediction === "Up";
+  const strokeColor = isUp ? "#10b981" : "#f43f5e";
+  const gradientId = `chart-grad-${ticker}`;
+
+  const yTicks = 4;
+  const yStep = priceRange / yTicks;
+  const yTickValues = Array.from({ length: yTicks + 1 }, (_, i) => minPrice + i * yStep);
+
+  const xTickCount = Math.min(6, points.length);
+  const xTickIndices = Array.from({ length: xTickCount }, (_, i) =>
+    Math.round((i / (xTickCount - 1)) * (points.length - 1)),
+  );
+
+  const lastClose = points[points.length - 1].close;
+  const firstClose = points[0].close;
+  const totalReturn = ((lastClose - firstClose) / firstClose) * 100;
+
+  const formatPrice = (v: number) =>
+    currency === "USD" || !currency ? `$${v.toFixed(2)}` : `${v.toFixed(2)} ${currency}`;
+
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const svgX = ((e.clientX - rect.left) / rect.width) * W;
+    const relX = svgX - padL;
+    const idx = Math.max(0, Math.min(points.length - 1, Math.round((relX / innerW) * (points.length - 1))));
+    const point = points[idx];
+    setTooltip({ x: xOf(idx), y: yOf(point.close), point });
+  };
+
+  return (
+    <div className="relative select-none">
+      <div className="mb-3 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+          {ticker} · 1-year close price
+        </span>
+        <span
+          className={clsx(
+            "rounded-full px-3 py-1 text-xs font-semibold",
+            totalReturn >= 0 ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700",
+          )}
+        >
+          {totalReturn >= 0 ? "+" : ""}
+          {totalReturn.toFixed(2)}% 1Y range
+        </span>
+      </div>
+
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="w-full"
+        onMouseMove={handleMouseMove}
+        onMouseLeave={() => setTooltip(null)}
+      >
+        <defs>
+          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={strokeColor} stopOpacity="0.18" />
+            <stop offset="100%" stopColor={strokeColor} stopOpacity="0.02" />
+          </linearGradient>
+          <clipPath id={`clip-${ticker}`}>
+            <rect x={padL} y={padT} width={innerW} height={innerH} />
+          </clipPath>
+        </defs>
+
+        {yTickValues.map((val) => (
+          <g key={val}>
+            <line
+              x1={padL}
+              x2={padL + innerW}
+              y1={yOf(val)}
+              y2={yOf(val)}
+              stroke="#e2e8f0"
+              strokeWidth="1"
+            />
+            <text
+              x={padL - 6}
+              y={yOf(val) + 4}
+              textAnchor="end"
+              fontSize="10"
+              fill="#94a3b8"
+              fontFamily="ui-monospace, monospace"
+            >
+              {val >= 1000 ? `${(val / 1000).toFixed(1)}k` : val.toFixed(1)}
+            </text>
+          </g>
+        ))}
+
+        {xTickIndices.map((idx) => (
+          <text
+            key={idx}
+            x={xOf(idx)}
+            y={padT + innerH + 20}
+            textAnchor="middle"
+            fontSize="10"
+            fill="#94a3b8"
+            fontFamily="ui-sans-serif, sans-serif"
+          >
+            {points[idx].date.slice(5)}
+          </text>
+        ))}
+
+        <path d={areaD} fill={`url(#${gradientId})`} clipPath={`url(#clip-${ticker})`} />
+        <path
+          d={pathD}
+          fill="none"
+          stroke={strokeColor}
+          strokeWidth="1.8"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+          clipPath={`url(#clip-${ticker})`}
+        />
+
+        <line
+          x1={padL}
+          x2={padL + innerW}
+          y1={yOf(lastClose)}
+          y2={yOf(lastClose)}
+          stroke={strokeColor}
+          strokeWidth="1"
+          strokeDasharray="3 3"
+          opacity="0.5"
+        />
+
+        <circle
+          cx={xOf(points.length - 1)}
+          cy={yOf(lastClose)}
+          r="4"
+          fill={strokeColor}
+          stroke="white"
+          strokeWidth="1.5"
+        />
+
+        {tooltip && (
+          <>
+            <line
+              x1={tooltip.x}
+              x2={tooltip.x}
+              y1={padT}
+              y2={padT + innerH}
+              stroke="#64748b"
+              strokeWidth="1"
+              strokeDasharray="3 3"
+            />
+            <circle cx={tooltip.x} cy={tooltip.y} r="4" fill={strokeColor} stroke="white" strokeWidth="1.5" />
+            <rect
+              x={Math.min(tooltip.x + 8, W - 118)}
+              y={Math.max(padT, tooltip.y - 26)}
+              width="110"
+              height="40"
+              rx="6"
+              fill="rgba(15,23,42,0.88)"
+            />
+            <text
+              x={Math.min(tooltip.x + 63, W - 63)}
+              y={Math.max(padT + 15, tooltip.y - 11)}
+              textAnchor="middle"
+              fontSize="10"
+              fill="rgba(255,255,255,0.65)"
+              fontFamily="ui-sans-serif, sans-serif"
+            >
+              {tooltip.point.date}
+            </text>
+            <text
+              x={Math.min(tooltip.x + 63, W - 63)}
+              y={Math.max(padT + 30, tooltip.y + 4)}
+              textAnchor="middle"
+              fontSize="12"
+              fontWeight="600"
+              fill="white"
+              fontFamily="ui-monospace, monospace"
+            >
+              {formatPrice(tooltip.point.close)}
+            </text>
+          </>
+        )}
+      </svg>
+    </div>
+  );
+}
+
 export default function Home() {
+  const { data: session } = useSession();
   const [ticker, setTicker] = useState("");
   const [tickers, setTickers] = useState<string[]>([]);
   const [results, setResults] = useState<PredictionResult[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -891,11 +1141,57 @@ export default function Home() {
   const [groupFilter, setGroupFilter] = useState<string>("all");
   const [showAllInputs, setShowAllInputs] = useState(false);
   const [nowMs, setNowMs] = useState(Date.now());
+  const [chartPoints, setChartPoints] = useState<ChartPoint[]>([]);
+  const [chartCurrency, setChartCurrency] = useState<string | null>(null);
+  const [chartTicker, setChartTicker] = useState<string | null>(null);
+  const [chartLoading, setChartLoading] = useState(false);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 15000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (session?.user?.email) {
+      fetchHistory();
+    } else {
+      setHistory([]);
+    }
+  }, [session]);
+
+  useEffect(() => {
+    const ticker = selectedTicker;
+    if (!ticker) return;
+    if (ticker === chartTicker) return;
+    setChartLoading(true);
+    setChartPoints([]);
+    fetch(`/api/chart?ticker=${encodeURIComponent(ticker)}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.points) {
+          setChartPoints(data.points);
+          setChartCurrency(data.currency ?? null);
+          setChartTicker(ticker);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setChartLoading(false));
+  }, [selectedTicker]);
+
+  const fetchHistory = async () => {
+    setLoadingHistory(true);
+    try {
+      const res = await fetch("/api/history");
+      if (res.ok) {
+        const data = await res.json();
+        setHistory(data.history || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch history:", err);
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
 
   useEffect(() => {
     if (results.length === 0) {
@@ -1037,6 +1333,9 @@ export default function Home() {
       }
 
       setResults(data.predictions ?? []);
+      if (session?.user?.email) {
+        setTimeout(() => fetchHistory(), 1500);
+      }
       setSearch("");
       setSourceFilter("all");
       setGroupFilter("all");
@@ -1057,19 +1356,125 @@ export default function Home() {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.45 }}
         >
-          <div className="flex flex-wrap items-center gap-3 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">
-            <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
-              Finnhub primary
-            </span>
-            <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
-              Yahoo fallback
-            </span>
-            <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
-              BigQuery audit trail
-            </span>
+          <div className="flex flex-wrap items-center justify-between gap-6">
+            <div className="flex flex-wrap items-center gap-3 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">
+              <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
+                Finnhub primary
+              </span>
+              <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
+                Yahoo fallback
+              </span>
+              <span className="rounded-full border border-white/70 bg-white/70 px-3 py-1">
+                BigQuery audit trail
+              </span>
+            </div>
+
+            <div className="flex items-center gap-4">
+              {session ? (
+                <div className="flex items-center gap-3">
+                  <div className="flex flex-col items-end">
+                    <span className="text-xs font-semibold text-slate-900">{session.user?.name}</span>
+                    <span className="text-[10px] text-slate-500">{session.user?.email}</span>
+                  </div>
+                  {session.user?.image ? (
+                    <img src={session.user.image} alt="" className="h-8 w-8 rounded-full border border-white" />
+                  ) : (
+                    <div className="flex h-8 w-8 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-400">
+                      <User className="h-4 w-4" />
+                    </div>
+                  )}
+                  <button
+                    onClick={() => signOut()}
+                    className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-900 text-white transition hover:bg-slate-800"
+                    title="Sign out"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => signIn("google")}
+                  className="flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-slate-600 transition hover:bg-slate-50"
+                >
+                  <LogIn className="h-3.5 w-3.5" />
+                  Sign in
+                </button>
+              )}
+            </div>
           </div>
 
-          <div className="mt-5 grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
+          {session && (
+            <div className="mt-5 rounded-[36px] border border-white/70 bg-white/75 p-6 shadow-[0_28px_90px_-52px_rgba(15,23,42,0.3)] backdrop-blur">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                    <History className="h-4 w-4 text-slate-500" />
+                    Your prediction history
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Showing your last 50 predictions linked to your account.
+                  </p>
+                </div>
+                {loadingHistory && <Loader2 className="h-4 w-4 animate-spin text-slate-400" />}
+              </div>
+
+              <div className="mt-6 overflow-hidden rounded-[24px] border border-slate-200/60 bg-white/50">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-slate-50/80 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
+                      <tr>
+                        <th className="px-6 py-4">Ticker</th>
+                        <th className="px-6 py-4">Prediction</th>
+                        <th className="px-6 py-4">Prob</th>
+                        <th className="px-6 py-4">Price</th>
+                        <th className="px-6 py-4">News</th>
+                        <th className="px-6 py-4 text-right">Date</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100/60">
+                      {history.length > 0 ? (
+                        history.map((item, idx) => (
+                          <tr key={`${item.request_id}-${idx}`} className="group hover:bg-slate-50/40">
+                            <td className="px-6 py-4 font-semibold text-slate-900">
+                              {item.ticker}
+                            </td>
+                            <td className="px-6 py-4">
+                              <span className={clsx(
+                                "rounded-full px-3 py-1 text-[11px] font-semibold",
+                                item.prediction === "Up" ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"
+                              )}>
+                                {item.prediction}
+                              </span>
+                            </td>
+                            <td className="px-6 py-4 tabular-nums text-slate-600">
+                              {(item.prob_up * 100).toFixed(1)}%
+                            </td>
+                            <td className="px-6 py-4 tabular-nums text-slate-600">
+                              {formatQuotedPrice(item.current_price)}
+                            </td>
+                            <td className="px-6 py-4 text-slate-500">
+                              {item.headline_count} headlines
+                            </td>
+                            <td className="px-6 py-4 text-right tabular-nums text-slate-400">
+                              {formatClock(item.predicted_at)}
+                            </td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={6} className="px-6 py-12 text-center text-slate-400">
+                            {loadingHistory ? "Loading your history..." : "No prediction history found yet. Run a prediction to get started."}
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="mt-8 grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
             <div className="rounded-[36px] border border-white/70 bg-white/75 p-6 shadow-[0_28px_90px_-52px_rgba(15,23,42,0.5)] backdrop-blur">
               <div className="flex items-start justify-between gap-6">
                 <div>
@@ -1361,6 +1766,7 @@ export default function Home() {
             </div>
           </div>
 
+
           {error && (
             <div className="mt-6 flex items-start gap-3 rounded-[26px] border border-rose-200 bg-rose-50/95 px-4 py-3 text-sm text-rose-700 shadow-sm">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -1492,6 +1898,32 @@ export default function Home() {
                     </div>
 
                     <TopDriverCards driverFeatures={topDriverFeatures} />
+
+                    <div className="rounded-[32px] border border-white/70 bg-white/80 p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)] backdrop-blur">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                        <BarChart3 className="h-4 w-4 text-slate-500" />
+                        Price history
+                      </div>
+                      <div className="mt-4">
+                        {chartLoading ? (
+                          <div className="flex h-48 items-center justify-center gap-2 text-sm text-slate-400">
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            Loading chart…
+                          </div>
+                        ) : chartPoints.length > 0 ? (
+                          <PriceChart
+                            points={chartPoints}
+                            ticker={activeResult.ticker}
+                            currency={chartCurrency}
+                            prediction={activeResult.prediction}
+                          />
+                        ) : (
+                          <div className="flex h-48 items-center justify-center text-sm text-slate-400">
+                            Chart unavailable
+                          </div>
+                        )}
+                      </div>
+                    </div>
 
                     <NewsRail result={activeResult} nowMs={nowMs} tone={newsTone} />
 

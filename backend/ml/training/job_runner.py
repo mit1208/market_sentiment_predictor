@@ -10,6 +10,12 @@ import json
 import logging
 import os
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from google.cloud import bigquery, storage
 
 from backend.config import get_env, get_float_env, qualify_table_name

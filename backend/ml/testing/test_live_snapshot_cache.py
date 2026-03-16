@@ -17,6 +17,7 @@ from backend.ml.shared.live_snapshot_cache import (
     CACHE_REASON_DAILY_BUDGET_EXHAUSTED,
     CACHE_REASON_DAILY_BUDGET_GUARD,
     CACHE_REASON_FRESH_CACHE,
+    CACHE_SOURCE_MODE_BIGQUERY,
     CACHE_SOURCE_MODE_LIVE_API,
     build_cache_status,
     evaluate_cache_reuse,
@@ -86,3 +87,22 @@ def test_build_cache_status_increments_live_fetch_usage_for_live_requests():
 
     assert status["daily_live_fetch_count"] == 5
     assert status["daily_live_fetch_remaining"] == 7
+
+
+def test_build_cache_status_does_not_increment_live_fetch_usage_for_cache_hits():
+    status = build_cache_status(
+        source_mode=CACHE_SOURCE_MODE_BIGQUERY,
+        reason="fresh_cache",
+        snapshot_timestamp="2026-03-14T15:00:00Z",
+        snapshot_age_seconds=120,
+        fresh_ttl_seconds=3600,
+        max_stale_ttl_seconds=21600,
+        daily_live_fetch_limit=12,
+        daily_live_fetch_count=4,
+        cache_hit=True,
+        stale_served=False,
+        quota_exhausted=False,
+    )
+
+    assert status["daily_live_fetch_count"] == 4
+    assert status["daily_live_fetch_remaining"] == 8

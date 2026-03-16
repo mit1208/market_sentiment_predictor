@@ -6,6 +6,12 @@ import logging
 import os
 import sys
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from backend.config import get_env, get_int_env
 from backend.ml.shared.notifications import maybe_send_feature_ranking_webhook
 from backend.ml.training.automl_selection import finalize_automl_feature_ranking

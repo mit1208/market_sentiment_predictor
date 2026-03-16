@@ -114,7 +114,29 @@ def _send_webhook_payload(
 ) -> tuple[bool, dict[str, Any]]:
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
-        response = requests.post(url, json=payload, timeout=timeout_seconds)
+        # Disable automatic redirect following so we can re-POST through each hop.
+        # requests converts POST → GET on 302 by default (RFC 2616 compliance), which
+        # silently drops the body for webhook targets like Google Apps Script /exec URLs.
+        session = requests.Session()
+        response = session.post(
+            url,
+            json=payload,
+            timeout=timeout_seconds,
+            allow_redirects=False,
+        )
+
+        max_hops = 5
+        while response.is_redirect and response.headers.get("Location") and max_hops > 0:
+            redirect_url = response.headers["Location"]
+            log.debug("Webhook redirect (%s) → %s", response.status_code, redirect_url)
+            response = session.post(
+                redirect_url,
+                json=payload,
+                timeout=timeout_seconds,
+                allow_redirects=False,
+            )
+            max_hops -= 1
+
         response.raise_for_status()
     except Exception as exc:
         log.warning("Webhook notification failed: %s", exc)

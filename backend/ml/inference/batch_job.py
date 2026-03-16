@@ -525,6 +525,11 @@ def _score_request(
         "predicted_at": predicted_at,
     }
 
+    # Embed prediction results into the feature_snapshot metadata for better caching/history
+    feature_snapshot["prediction"] = label
+    feature_snapshot["confidence"] = round(float(confidence), 4)
+    feature_snapshot["prob_up"] = round(float(probability), 4)
+
     snapshot_row = build_live_feature_snapshot_row(
         snapshot_id=build_snapshot_id(
             "batchcache" if snapshot_source == SNAPSHOT_SOURCE_BATCH_CACHE else "batch",
