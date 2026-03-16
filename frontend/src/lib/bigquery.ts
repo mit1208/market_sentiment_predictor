@@ -1,8 +1,25 @@
 import { BigQuery } from "@google-cloud/bigquery";
 
-const bigquery = new BigQuery({
-  projectId: process.env.GCP_PROJECT_ID,
-});
+function loadCredentialsFromEnv(): { client_email?: string; private_key?: string } | undefined {
+  const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw) as { client_email?: string; private_key?: string };
+  } catch {
+    throw new Error("GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON.");
+  }
+}
+
+export function getBigQueryClient(): BigQuery {
+  const projectId = process.env.GCP_PROJECT_ID;
+  const credentials = loadCredentialsFromEnv();
+  return new BigQuery({
+    projectId,
+    credentials,
+  });
+}
+
+const bigquery = getBigQueryClient();
 
 export async function getFreshSnapshots(tickers: string[], ttlSeconds: number) {
   if (tickers.length === 0) return [];

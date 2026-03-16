@@ -1,4 +1,4 @@
-import { BigQuery } from "@google-cloud/bigquery";
+import { getBigQueryClient } from "./bigquery";
 
 export interface ModelReliabilityFold {
   fold: number;
@@ -93,7 +93,7 @@ function parseIntValue(value: string | null | undefined): number | null {
 }
 
 export async function fetchModelReliabilitySnapshot(): Promise<ModelReliabilitySnapshot> {
-  const bigquery = new BigQuery({ projectId: PROJECT_ID });
+  const bigquery = getBigQueryClient();
   const [rows] = await bigquery.query({
     query: MODEL_RELIABILITY_QUERY,
     useLegacySql: false,
