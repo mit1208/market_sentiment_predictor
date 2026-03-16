@@ -342,12 +342,13 @@ export async function POST(req: NextRequest) {
   // 3. Log results to BigQuery for authenticated users
   const userEmail = session?.user?.email ?? null;
   if (userEmail) {
-    // Log each prediction to user_prediction_log without blocking the response
-    Promise.all(
-      finalPredictions.map((p) => logUserPrediction(userEmail, p.request_id, p.ticker))
-    ).catch((error) => {
-      console.error("Failed to log predictions to BigQuery in background:", error);
-    });
+    try {
+      await Promise.all(
+        finalPredictions.map((p) => logUserPrediction(userEmail, p.request_id, p.ticker))
+      );
+    } catch (error) {
+      console.error("Failed to log predictions to BigQuery:", error);
+    }
   }
 
   return NextResponse.json({ predictions: finalPredictions });

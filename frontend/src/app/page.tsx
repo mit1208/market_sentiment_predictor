@@ -1169,7 +1169,43 @@ export default function Home() {
   const [chartCurrency, setChartCurrency] = useState<string | null>(null);
   const [chartTicker, setChartTicker] = useState<string | null>(null);
   const [chartLoading, setChartLoading] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
   const autoBootstrapped = useRef(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const storedResults = window.localStorage.getItem("predictionResults");
+      const storedTicker = window.localStorage.getItem("selectedTicker");
+      if (storedResults) {
+        const parsed = JSON.parse(storedResults);
+        if (Array.isArray(parsed)) {
+          setResults(parsed as PredictionResult[]);
+        }
+      }
+      if (storedTicker) {
+        setSelectedTicker(storedTicker);
+      }
+    } catch {
+      // Ignore malformed local storage values.
+    } finally {
+      setHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated || typeof window === "undefined") return;
+    window.localStorage.setItem("predictionResults", JSON.stringify(results));
+  }, [results, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated || typeof window === "undefined") return;
+    if (selectedTicker) {
+      window.localStorage.setItem("selectedTicker", selectedTicker);
+    } else {
+      window.localStorage.removeItem("selectedTicker");
+    }
+  }, [selectedTicker, hydrated]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 15000);
@@ -1233,6 +1269,7 @@ export default function Home() {
   }, [results, tickers]);
 
   useEffect(() => {
+    if (!hydrated) return;
     if (autoBootstrapped.current) return;
     if (loading) return;
     if (results.length > 0) return;

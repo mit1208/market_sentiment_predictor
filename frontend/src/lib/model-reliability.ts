@@ -1,4 +1,4 @@
-import { GoogleAuth } from "google-auth-library";
+import { BigQuery } from "@google-cloud/bigquery";
 
 export interface ModelReliabilityFold {
   fold: number;
@@ -46,32 +46,6 @@ export interface ModelReliabilitySnapshot {
   folds: ModelReliabilityFold[];
 }
 
-interface BigQueryField {
-  name: string;
-}
-
-interface BigQueryRowCell {
-  v: string | null;
-}
-
-interface BigQueryRow {
-  f: BigQueryRowCell[];
-}
-
-interface BigQueryResponse {
-  jobComplete?: boolean;
-  rows?: BigQueryRow[];
-  schema?: {
-    fields?: BigQueryField[];
-  };
-  error?: {
-    message?: string;
-  };
-  errors?: Array<{
-    message?: string;
-  }>;
-}
-
 const PROJECT_ID =
   process.env.GCP_PROJECT_ID ??
   process.env.GOOGLE_CLOUD_PROJECT ??
@@ -109,23 +83,6 @@ const MODEL_RELIABILITY_QUERY = `
   LIMIT 1
 `;
 
-function getAccessTokenValue(token: unknown): string | null {
-  if (!token) {
-    return null;
-  }
-
-  if (typeof token === "string") {
-    return token;
-  }
-
-  if (typeof token === "object" && token !== null && "token" in token) {
-    const value = (token as { token?: string | null }).token;
-    return typeof value === "string" ? value : null;
-  }
-
-  return null;
-}
-
 function parseIntValue(value: string | null | undefined): number | null {
   if (!value) {
     return null;
@@ -135,64 +92,18 @@ function parseIntValue(value: string | null | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function mapFirstRow(payload: BigQueryResponse): Record<string, string | null> {
-  const fields = payload.schema?.fields ?? [];
-  const row = payload.rows?.[0];
+export async function fetchModelReliabilitySnapshot(): Promise<ModelReliabilitySnapshot> {
+  const bigquery = new BigQuery({ projectId: PROJECT_ID });
+  const [rows] = await bigquery.query({
+    query: MODEL_RELIABILITY_QUERY,
+    useLegacySql: false,
+    location: BIGQUERY_LOCATION,
+  });
 
-  if (!row || fields.length === 0) {
+  const row = rows?.[0] as Record<string, string | null> | undefined;
+  if (!row) {
     throw new Error("No model metadata rows found in BigQuery.");
   }
-
-  return Object.fromEntries(
-    fields.map((field, index) => [field.name, row.f[index]?.v ?? null]),
-  );
-}
-
-export async function fetchModelReliabilitySnapshot(): Promise<ModelReliabilitySnapshot> {
-  const auth = new GoogleAuth({
-    scopes: ["https://www.googleapis.com/auth/cloud-platform"],
-  });
-  const client = await auth.getClient();
-  const token = getAccessTokenValue(await client.getAccessToken());
-
-  if (!token) {
-    throw new Error("Unable to acquire Google Cloud access token for BigQuery.");
-  }
-
-  const response = await fetch(
-    `https://bigquery.googleapis.com/bigquery/v2/projects/${PROJECT_ID}/queries`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        query: MODEL_RELIABILITY_QUERY,
-        useLegacySql: false,
-        location: BIGQUERY_LOCATION,
-        timeoutMs: 20000,
-        maxResults: 1,
-      }),
-      cache: "no-store",
-    },
-  );
-
-  const payload = (await response.json()) as BigQueryResponse;
-
-  if (!response.ok) {
-    throw new Error(
-      payload.error?.message ??
-      payload.errors?.[0]?.message ??
-      `BigQuery request failed with HTTP ${response.status}.`,
-    );
-  }
-
-  if (!payload.jobComplete) {
-    throw new Error("BigQuery job did not complete in time.");
-  }
-
-  const row = mapFirstRow(payload);
 
   const performanceMetrics = JSON.parse(row.performance_metrics ?? "{}") as {
     deployment_status?: string;
