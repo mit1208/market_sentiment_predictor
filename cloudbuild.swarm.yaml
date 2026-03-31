@@ -1,0 +1,11 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - backend/swarm/Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/market-sentiment/swarm:latest
+      - .
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/market-sentiment/swarm:latest
