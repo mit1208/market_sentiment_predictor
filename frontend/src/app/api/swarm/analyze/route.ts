@@ -2,8 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
+const DEFAULT_SWARM_API_URL = "https://swarm-service-749244369851.us-central1.run.app";
+
 function getSwarmUrl(path: string): string {
-  const baseUrl = process.env.SWARM_API_URL?.trim();
+  const baseUrl = process.env.SWARM_API_URL?.trim() || DEFAULT_SWARM_API_URL;
   if (!baseUrl) {
     return "";
   }
@@ -14,7 +16,7 @@ export async function POST(req: NextRequest) {
   const swarmUrl = getSwarmUrl("/swarm/analyze");
   if (!swarmUrl) {
     return NextResponse.json(
-      { error: "Swarm service is not configured. Set SWARM_API_URL in frontend/.env.local." },
+      { error: "Swarm service is not configured." },
       { status: 500 },
     );
   }

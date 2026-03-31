@@ -77,6 +77,92 @@ def _subset_for_agent(persona: AgentPersona, feature_snapshot: dict[str, Any]) -
     return {name: features.get(name) for name in persona.feature_subset}
 
 
+def _grouped_feature_context(feature_snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for group in feature_snapshot.get("groups") or []:
+        label = str(group.get("label") or group.get("key") or "unknown")
+        grouped[label] = {}
+        for feature in group.get("features", []):
+            name = feature.get("name")
+            if name:
+                grouped[label][str(name)] = feature.get("value")
+    return grouped
+
+
+def _top_feature_context(feature_snapshot: dict[str, Any], limit: int = 20) -> dict[str, Any]:
+    features = _feature_map(feature_snapshot)
+    preferred = [
+        "current_price",
+        "day_change_pct",
+        "gap_pct",
+        "intraday_range_pct",
+        "day_range_position",
+        "volume_vs_avg_10d",
+        "price_vs_50d_avg",
+        "return_5d",
+        "return_20d",
+        "price_acceleration",
+        "relative_strength_20d",
+        "gemini_sentiment_avg",
+        "gemini_sentiment_max",
+        "gemini_sentiment_min",
+        "gemini_magnitude_avg",
+        "headline_count",
+        "sentiment_dispersion",
+        "yield_curve_spread",
+        "credit_spread",
+        "spy_change_pct",
+        "vix_level",
+        "vix_change_pct",
+        "dxy_change_5d",
+        "fed_funds_rate",
+        "fed_funds_change_3m",
+        "universe_breadth_50d",
+    ]
+    selected = {name: features.get(name) for name in preferred if name in features}
+    if len(selected) < limit:
+        for name, value in features.items():
+            if name in selected:
+                continue
+            selected[name] = value
+            if len(selected) >= limit:
+                break
+    return selected
+
+
+def _news_context(news_items: list[dict[str, Any]], limit: int = 8) -> list[dict[str, Any]]:
+    ordered = sorted(
+        news_items,
+        key=lambda item: item.get("published_at") or "",
+        reverse=True,
+    )
+    return [
+        {
+            "headline": item.get("headline"),
+            "published_at": item.get("published_at"),
+            "sentiment_score": item.get("sentiment_score"),
+            "sentiment_label": item.get("sentiment_label"),
+            "magnitude": item.get("magnitude"),
+            "category": item.get("category"),
+        }
+        for item in ordered[:limit]
+    ]
+
+
+def _persona_runtime_notes(persona: AgentPersona) -> str:
+    stats = persona.calibration_stats or {}
+    if not stats:
+        return "No recent calibration stats are available yet."
+    return (
+        "Recent calibration context: "
+        f"30d verdicts={stats.get('verdict_count_30d')}, "
+        f"30d accuracy={stats.get('accuracy_30d')}, "
+        f"30d agree_rate={stats.get('agree_rate_30d')}, "
+        f"30d avg_confidence_delta={stats.get('avg_confidence_delta_30d')}."
+        " Use this only as self-correction context, not as evidence about the ticker."
+    )
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -228,20 +314,29 @@ class DeliberationOrchestrator:
         request: SwarmAnalyzeRequest,
     ) -> str:
         subset = _subset_for_agent(persona, request.feature_snapshot)
-        headlines = [
-            item.get("headline", "")
-            for item in sorted(
-                request.news_items,
-                key=lambda item: item.get("published_at") or "",
-                reverse=True,
-            )[:5]
-        ]
+        all_features = _top_feature_context(request.feature_snapshot, limit=28)
+        grouped_features = _grouped_feature_context(request.feature_snapshot)
+        headlines = _news_context(request.news_items)
+        provider_summary = request.feature_snapshot.get("provider_summary") or {}
+        cache_status = request.feature_snapshot.get("cache_status") or {}
         return (
             f"{persona.system_prompt}\n\n"
+            "You are participating in a four-agent equity deliberation. Use the full live feature"
+            " snapshot, recent sentiment-scored headlines, and historical-style signals already"
+            " embedded in the snapshot. Do not ignore past-data proxies such as moving averages,"
+            " momentum, breadth, spreads, and volatility regime.\n\n"
+            f"{_persona_runtime_notes(persona)}\n"
             f"Ticker: {request.ticker}\n"
             f"Model prediction: {request.ml_prediction.model_dump()}\n"
-            f"Feature subset: {subset}\n"
-            f"Recent headlines: {headlines}\n"
+            f"Your focus features: {subset}\n"
+            f"Full key feature frame: {all_features}\n"
+            f"Grouped feature frame: {grouped_features}\n"
+            f"Recent sentiment-scored headlines: {headlines}\n"
+            f"Provider summary: {provider_summary}\n"
+            f"Cache status: {cache_status}\n"
+            "When reasoning, explicitly weigh trend/momentum, volatility/risk, macro regime,"
+            " and the tone/dispersion of news. Confidence_delta should adjust the base model"
+            " confidence, not replace it.\n"
             "Return structured JSON only."
         )
 
@@ -259,14 +354,20 @@ class DeliberationOrchestrator:
                 "direction": verdict.direction,
                 "conviction": verdict.conviction,
                 "thesis": verdict.thesis,
+                "key_signals": verdict.key_signals,
             }
             for verdict in peer_verdicts
         ]
         return (
             f"{persona.system_prompt}\n\n"
+            "Re-evaluate your position after reading the other analysts. Preserve your independence,"
+            " but update if their use of the same full feature frame is materially stronger.\n\n"
+            f"{_persona_runtime_notes(persona)}\n"
             f"Ticker: {request.ticker}\n"
             f"Your round 1 verdict: {own_verdict.model_dump()}\n"
             f"Other agents: {peer_summary}\n"
+            f"Full key feature frame: {_top_feature_context(request.feature_snapshot, limit=28)}\n"
+            f"Recent sentiment-scored headlines: {_news_context(request.news_items)}\n"
             "Return structured JSON only."
         )
 
