@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -19,6 +19,7 @@ import {
   Loader2,
   LogIn,
   LogOut,
+  MessageSquare,
   Newspaper,
   Plus,
   Search,
@@ -131,10 +132,64 @@ interface PredictionResult {
   feature_snapshot: FeatureSnapshot;
 }
 
+type AnalysisMode = "quick" | "deep";
 type SourceFilter = "all" | "finnhub" | "yahoo" | "derived";
 type SortMode = "group" | "value" | "source";
 type Exchange = "NYSE" | "TSX";
 const DEFAULT_TICKERS: string[] = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"];
+
+interface SwarmVerdictEvent {
+  direction: "Up" | "Down";
+  conviction: "low" | "medium" | "high";
+  thesis: string;
+  agrees_with_model: boolean;
+  key_signals?: string[];
+  rebuttals?: Record<string, string>;
+  revised?: boolean;
+}
+
+interface SwarmAgentState {
+  agentId: string;
+  agent: string;
+  round1?: SwarmVerdictEvent;
+  round2?: SwarmVerdictEvent;
+}
+
+interface SwarmModeratorVerdict {
+  deliberation_id: string;
+  request_id: string;
+  ticker: string;
+  final_direction: "Up" | "Down";
+  final_confidence: number;
+  direction_overridden: boolean;
+  consensus: string;
+  dissent?: string | null;
+}
+
+interface InterviewTurn {
+  role: "user" | "agent";
+  message: string;
+}
+
+interface SwarmLogEntry {
+  id: string;
+  at: string;
+  kind: "system" | "stream" | "interview" | "error";
+  title: string;
+  detail: string;
+  payload?: Record<string, unknown> | null;
+}
+
+interface SwarmTickerState {
+  requestId: string;
+  status: "idle" | "streaming" | "done" | "error";
+  deliberationId?: string;
+  agents: Record<string, SwarmAgentState>;
+  moderator?: SwarmModeratorVerdict;
+  error?: string;
+  interviewTurns: InterviewTurn[];
+  logs: SwarmLogEntry[];
+}
 
 interface HistoryItem {
   request_id: string;
@@ -616,6 +671,313 @@ function TopDriverCards({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function getConvictionClasses(conviction: SwarmVerdictEvent["conviction"]): string {
+  if (conviction === "high") {
+    return "border-rose-200 bg-rose-50 text-rose-700";
+  }
+  if (conviction === "medium") {
+    return "border-amber-200 bg-amber-50 text-amber-800";
+  }
+  return "border-slate-200 bg-slate-100 text-slate-700";
+}
+
+function formatSwarmLogTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "Pending";
+  }
+  return date.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function getSwarmLogTone(kind: SwarmLogEntry["kind"]): string {
+  if (kind === "error") {
+    return "border-rose-200 bg-rose-50/90";
+  }
+  if (kind === "interview") {
+    return "border-amber-200 bg-amber-50/80";
+  }
+  if (kind === "stream") {
+    return "border-teal-200 bg-teal-50/70";
+  }
+  return "border-slate-200 bg-slate-50/90";
+}
+
+function SwarmAnalysisPanel({
+  ticker,
+  swarm,
+  onRetry,
+  onAsk,
+  interviewAgent,
+  setInterviewAgent,
+  interviewQuestion,
+  setInterviewQuestion,
+  interviewLoading,
+}: {
+  ticker: string;
+  swarm: SwarmTickerState | null;
+  onRetry: () => void;
+  onAsk: () => void;
+  interviewAgent: string;
+  setInterviewAgent: (value: string) => void;
+  interviewQuestion: string;
+  setInterviewQuestion: (value: string) => void;
+  interviewLoading: boolean;
+}) {
+  return (
+    <div className="rounded-[32px] border border-slate-200/70 bg-[linear-gradient(145deg,rgba(11,59,90,0.05),rgba(15,118,110,0.08),rgba(255,255,255,0.94))] p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)]">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+            <Brain className="h-4 w-4 text-teal-700" />
+            Swarm analysis
+          </div>
+          <p className="mt-2 text-sm leading-6 text-slate-600">
+            Four analyst personas review the ML call for {ticker}, debate it in two rounds, and
+            then a deterministic moderator sets the final verdict.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-600">
+            {swarm?.status === "streaming"
+              ? "Streaming"
+              : swarm?.status === "done"
+                ? "Complete"
+                : swarm?.status === "error"
+                  ? "Error"
+                  : "Idle"}
+          </span>
+          <button
+            onClick={onRetry}
+            className="rounded-full bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+          >
+            {swarm ? "Re-run analysis" : "Run analysis"}
+          </button>
+        </div>
+      </div>
+
+      {swarm?.error && (
+        <div className="mt-4 rounded-[20px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {swarm.error}
+        </div>
+      )}
+
+      <div className="mt-5 grid gap-4 lg:grid-cols-2">
+        {Object.values(swarm?.agents ?? {}).map((agent) => (
+          <div key={agent.agentId} className="rounded-[24px] border border-white/80 bg-white/85 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                  Analyst
+                </div>
+                <h3 className="mt-1 text-lg font-semibold text-slate-950">{agent.agent}</h3>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {agent.round2 && (
+                  <span className={clsx("rounded-full border px-2.5 py-1 text-[11px] font-semibold", getConvictionClasses(agent.round2.conviction))}>
+                    {agent.round2.conviction}
+                  </span>
+                )}
+                <span
+                  className={clsx(
+                    "rounded-full px-2.5 py-1 text-[11px] font-semibold",
+                    (agent.round2?.direction ?? agent.round1?.direction) === "Up"
+                      ? "bg-emerald-50 text-emerald-700"
+                      : "bg-rose-50 text-rose-700",
+                  )}
+                >
+                  {agent.round2?.direction ?? agent.round1?.direction ?? "Pending"}
+                </span>
+              </div>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <div className="rounded-[18px] border border-slate-200/70 bg-slate-50/70 p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
+                  Round 1
+                </div>
+                <p className="mt-2 text-sm leading-6 text-slate-700">
+                  {agent.round1?.thesis ?? "Waiting for first-pass verdict…"}
+                </p>
+              </div>
+              <div className="rounded-[18px] border border-slate-200/70 bg-slate-50/70 p-3">
+                <div className="flex items-center justify-between gap-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
+                  <span>Round 2</span>
+                  {agent.round2?.revised && <span className="text-amber-700">Revised</span>}
+                </div>
+                <p className="mt-2 text-sm leading-6 text-slate-700">
+                  {agent.round2?.thesis ?? "Waiting for response round…"}
+                </p>
+                {agent.round2?.rebuttals && Object.keys(agent.round2.rebuttals).length > 0 && (
+                  <div className="mt-3 space-y-2">
+                    {Object.entries(agent.round2.rebuttals).map(([label, message]) => (
+                      <div key={label} className="rounded-[16px] border border-slate-200 bg-white px-3 py-2 text-xs leading-5 text-slate-600">
+                        <span className="font-semibold text-slate-800">{label}:</span> {message}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {agent.round1?.key_signals && agent.round1.key_signals.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {agent.round1.key_signals.map((signal) => (
+                    <span key={signal} className="rounded-full border border-teal-200 bg-teal-50 px-2.5 py-1 text-[11px] font-semibold text-teal-700">
+                      {signal}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {swarm?.status === "streaming" && Object.keys(swarm.agents).length === 0 && (
+        <div className="mt-5 flex items-center gap-2 text-sm text-slate-500">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Agents are forming initial positions…
+        </div>
+      )}
+
+      {swarm?.moderator && (
+        <div className="mt-5 rounded-[24px] border border-slate-200/80 bg-slate-950 p-5 text-white">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-white/60">
+                Moderator verdict
+              </div>
+              <div className="mt-2 text-2xl font-semibold tracking-tight">
+                {swarm.moderator.final_direction} · {(swarm.moderator.final_confidence * 100).toFixed(1)}%
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 text-xs font-semibold uppercase tracking-[0.16em]">
+              <span className="rounded-full border border-white/15 bg-white/10 px-3 py-1">
+                {swarm.moderator.consensus}
+              </span>
+              {swarm.moderator.direction_overridden && (
+                <span className="rounded-full border border-amber-300/30 bg-amber-400/20 px-3 py-1 text-amber-100">
+                  Override
+                </span>
+              )}
+            </div>
+          </div>
+          {swarm.moderator.dissent && (
+            <p className="mt-3 text-sm leading-6 text-white/75">{swarm.moderator.dissent}</p>
+          )}
+        </div>
+      )}
+
+      <div className="mt-5 rounded-[24px] border border-slate-200/70 bg-white/90 p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+              <Activity className="h-4 w-4 text-slate-500" />
+              Live swarm log
+            </div>
+            <p className="mt-1 text-sm text-slate-600">
+              Every streamed event, system update, and analyst reply stays visible here.
+            </p>
+          </div>
+          <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+            {swarm?.logs.length ?? 0} entries
+          </span>
+        </div>
+
+        <div className="mt-4 max-h-[26rem] space-y-3 overflow-y-auto pr-1">
+          {swarm?.logs.length ? (
+            swarm.logs.map((entry) => (
+              <div
+                key={entry.id}
+                className={clsx("rounded-[18px] border px-4 py-3", getSwarmLogTone(entry.kind))}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-semibold text-slate-900">{entry.title}</div>
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                    {formatSwarmLogTime(entry.at)}
+                  </div>
+                </div>
+                <p className="mt-2 text-sm leading-6 text-slate-700">{entry.detail}</p>
+                {entry.payload && (
+                  <details className="mt-3">
+                    <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Raw payload
+                    </summary>
+                    <pre className="mt-2 overflow-x-auto rounded-[14px] bg-slate-950 px-3 py-3 text-xs leading-5 text-slate-100">
+                      {JSON.stringify(entry.payload, null, 2)}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            ))
+          ) : (
+            <div className="rounded-[18px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-500">
+              Swarm activity will appear here as soon as deep analysis starts.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {swarm?.deliberationId && (
+        <div className="mt-5 rounded-[24px] border border-slate-200/70 bg-white/85 p-4">
+          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+            <MessageSquare className="h-4 w-4 text-slate-500" />
+            Ask the analysts
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-[180px_1fr_auto]">
+            <select
+              value={interviewAgent}
+              onChange={(event) => setInterviewAgent(event.target.value)}
+              className="rounded-[18px] border border-slate-200 bg-white px-3 py-3 text-sm text-slate-900 outline-none"
+            >
+              {Object.values(swarm.agents).map((agent) => (
+                <option key={agent.agentId} value={agent.agentId}>
+                  {agent.agent}
+                </option>
+              ))}
+            </select>
+            <input
+              value={interviewQuestion}
+              onChange={(event) => setInterviewQuestion(event.target.value)}
+              placeholder="Why did you challenge the model?"
+              className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none placeholder:text-slate-400"
+            />
+            <button
+              onClick={onAsk}
+              disabled={!interviewQuestion.trim() || interviewLoading}
+              className="rounded-[18px] bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {interviewLoading ? "Asking…" : "Ask"}
+            </button>
+          </div>
+          {swarm.interviewTurns.length > 0 && (
+            <div className="mt-4 space-y-3">
+              {swarm.interviewTurns.map((turn, index) => (
+                <div
+                  key={`${turn.role}-${index}`}
+                  className={clsx(
+                    "rounded-[18px] px-4 py-3 text-sm leading-6",
+                    turn.role === "user"
+                      ? "border border-slate-200 bg-slate-50 text-slate-700"
+                      : "border border-teal-200 bg-teal-50/70 text-slate-800",
+                  )}
+                >
+                  <span className="mr-2 font-semibold uppercase tracking-[0.14em] text-slate-500">
+                    {turn.role === "user" ? "You" : "Agent"}
+                  </span>
+                  {turn.message}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1153,12 +1515,17 @@ export default function Home() {
   const [ticker, setTicker] = useState("");
   const [tickers, setTickers] = useState<string[]>(DEFAULT_TICKERS);
   const [exchange, setExchange] = useState<Exchange>("NYSE");
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("quick");
   const [results, setResults] = useState<PredictionResult[]>([]);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [swarmByTicker, setSwarmByTicker] = useState<Record<string, SwarmTickerState>>({});
+  const [interviewQuestion, setInterviewQuestion] = useState("");
+  const [interviewAgent, setInterviewAgent] = useState("");
+  const [interviewLoading, setInterviewLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
   const [sortMode, setSortMode] = useState<SortMode>("group");
@@ -1171,6 +1538,7 @@ export default function Home() {
   const [chartLoading, setChartLoading] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const autoBootstrapped = useRef(false);
+  const swarmAbortControllers = useRef<Record<string, AbortController>>({});
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1237,7 +1605,7 @@ export default function Home() {
       })
       .catch(() => { })
       .finally(() => setChartLoading(false));
-  }, [selectedTicker]);
+  }, [selectedTicker, chartTicker]);
 
   const fetchHistory = async () => {
     setLoadingHistory(true);
@@ -1253,6 +1621,354 @@ export default function Home() {
       setLoadingHistory(false);
     }
   };
+
+  const appendSwarmLog = (
+    tickerSymbol: string,
+    requestId: string,
+    entry: Omit<SwarmLogEntry, "id" | "at"> & { at?: string },
+  ) => {
+    upsertSwarmState(tickerSymbol, (current) => {
+      const next: SwarmTickerState = current ?? {
+        requestId,
+        status: "streaming",
+        agents: {},
+        interviewTurns: [],
+        logs: [],
+      };
+      return {
+        ...next,
+        requestId,
+        logs: [
+          ...(next.logs ?? []),
+          {
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            at: entry.at ?? new Date().toISOString(),
+            kind: entry.kind,
+            title: entry.title,
+            detail: entry.detail,
+            payload: entry.payload ?? null,
+          },
+        ],
+      };
+    });
+  };
+
+  const buildSwarmLogEntry = (
+    eventName: string,
+    payload: Record<string, unknown>,
+  ): Omit<SwarmLogEntry, "id" | "at"> => {
+    if (eventName === "round1_verdict") {
+      return {
+        kind: "stream",
+        title: `${String(payload.agent ?? "Agent")} · Round 1`,
+        detail: `${String(payload.direction ?? "Pending")} with ${String(payload.conviction ?? "unknown")} conviction. ${String(payload.thesis ?? "")}`,
+        payload,
+      };
+    }
+    if (eventName === "round2_verdict") {
+      return {
+        kind: "stream",
+        title: `${String(payload.agent ?? "Agent")} · Round 2`,
+        detail: `${payload.revised ? "Revised view." : "Held position."} ${String(payload.direction ?? "Pending")} with ${String(payload.conviction ?? "unknown")} conviction. ${String(payload.thesis ?? "")}`,
+        payload,
+      };
+    }
+    if (eventName === "moderator_verdict") {
+      return {
+        kind: "stream",
+        title: "Moderator verdict",
+        detail: `${String(payload.final_direction ?? "Pending")} at ${typeof payload.final_confidence === "number" ? `${((payload.final_confidence as number) * 100).toFixed(1)}%` : "unknown confidence"}. ${String(payload.consensus ?? "")}`,
+        payload,
+      };
+    }
+    if (eventName === "done") {
+      return {
+        kind: "system",
+        title: "Swarm analysis complete",
+        detail: `Deliberation ${String(payload.deliberation_id ?? "")} is ready for replay and follow-up questions.`,
+        payload,
+      };
+    }
+    return {
+      kind: "system",
+      title: eventName,
+      detail: "Received swarm event.",
+      payload,
+    };
+  };
+
+  const upsertSwarmState = (tickerSymbol: string, updater: (current: SwarmTickerState | null) => SwarmTickerState) => {
+    setSwarmByTicker((current) => ({
+      ...current,
+      [tickerSymbol]: updater(current[tickerSymbol] ?? null),
+    }));
+  };
+
+  const applySwarmEvent = (
+    tickerSymbol: string,
+    requestId: string,
+    eventName: string,
+    payload: Record<string, unknown>,
+  ) => {
+    upsertSwarmState(tickerSymbol, (current) => {
+      const next: SwarmTickerState = current ?? {
+        requestId,
+        status: "streaming",
+        agents: {},
+        interviewTurns: [],
+        logs: [],
+      };
+      next.requestId = requestId;
+
+      if (eventName === "round1_verdict" || eventName === "round2_verdict") {
+        const agentId = String(payload.agent_id ?? "");
+        const agentLabel = String(payload.agent ?? agentId);
+        const agentState = next.agents[agentId] ?? { agentId, agent: agentLabel };
+        const verdict: SwarmVerdictEvent = {
+          direction: String(payload.direction ?? "Up") as "Up" | "Down",
+          conviction: String(payload.conviction ?? "medium") as "low" | "medium" | "high",
+          thesis: String(payload.thesis ?? ""),
+          agrees_with_model: Boolean(payload.agrees_with_model),
+          key_signals: Array.isArray(payload.key_signals)
+            ? payload.key_signals.map((value) => String(value))
+            : undefined,
+          rebuttals:
+            payload.rebuttals && typeof payload.rebuttals === "object"
+              ? Object.fromEntries(
+                  Object.entries(payload.rebuttals).map(([key, value]) => [key, String(value)]),
+                )
+              : undefined,
+          revised: typeof payload.revised === "boolean" ? payload.revised : undefined,
+        };
+        if (eventName === "round1_verdict") {
+          agentState.round1 = verdict;
+        } else {
+          agentState.round2 = verdict;
+        }
+        next.agents = { ...next.agents, [agentId]: agentState };
+      } else if (eventName === "moderator_verdict") {
+        next.moderator = payload as unknown as SwarmModeratorVerdict;
+      } else if (eventName === "done") {
+        next.deliberationId = String(payload.deliberation_id ?? "");
+        next.status = "done";
+      }
+
+      return { ...next };
+    });
+    appendSwarmLog(tickerSymbol, requestId, buildSwarmLogEntry(eventName, payload));
+  };
+
+  const parseSseChunk = (
+    chunk: string,
+    onEvent: (eventName: string, payload: Record<string, unknown>) => void,
+  ) => {
+    const events = chunk.split("\n\n").filter(Boolean);
+    for (const eventBlock of events) {
+      let eventName = "message";
+      let dataText = "";
+      for (const line of eventBlock.split("\n")) {
+        if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataText += line.slice(5).trim();
+        }
+      }
+      if (!dataText) {
+        continue;
+      }
+      try {
+        onEvent(eventName, JSON.parse(dataText) as Record<string, unknown>);
+      } catch {
+        // Ignore malformed chunks from partial buffers.
+      }
+    }
+  };
+
+  const startSwarmAnalysis = async (result: PredictionResult) => {
+    const existing = swarmAbortControllers.current[result.ticker];
+    existing?.abort();
+    const controller = new AbortController();
+    swarmAbortControllers.current[result.ticker] = controller;
+
+    setInterviewQuestion("");
+    upsertSwarmState(result.ticker, (current) => ({
+      requestId: result.request_id,
+      status: "streaming",
+      agents: {},
+      interviewTurns: current?.requestId === result.request_id ? current.interviewTurns : [],
+      logs:
+        current?.requestId === result.request_id
+          ? current.logs
+          : [],
+      deliberationId: undefined,
+      moderator: undefined,
+    }));
+    appendSwarmLog(result.ticker, result.request_id, {
+      kind: "system",
+      title: "Swarm analysis started",
+      detail: `Requesting deep analysis for ${result.ticker} from the live prediction snapshot.`,
+      payload: {
+        ticker: result.ticker,
+        request_id: result.request_id,
+        ml_prediction: {
+          direction: result.prediction,
+          confidence: result.confidence,
+          probability: result.prob_up,
+        },
+      },
+    });
+
+    try {
+      const response = await fetch("/api/swarm/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ticker: result.ticker,
+          request_id: result.request_id,
+          ml_prediction: {
+            direction: result.prediction,
+            confidence: result.confidence,
+            probability: result.prob_up,
+          },
+          feature_snapshot: result.feature_snapshot,
+          news_items: result.feature_snapshot.news_items,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        const payload = await response.json().catch(() => ({ error: "Swarm analysis failed." }));
+        throw new Error(getErrorMessage((payload as { error?: unknown }).error));
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (buffer.trim()) {
+            parseSseChunk(buffer, (eventName, payload) =>
+              applySwarmEvent(result.ticker, result.request_id, eventName, payload),
+            );
+          }
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const boundary = buffer.lastIndexOf("\n\n");
+        if (boundary !== -1) {
+          const complete = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          parseSseChunk(complete, (eventName, payload) =>
+            applySwarmEvent(result.ticker, result.request_id, eventName, payload),
+          );
+        }
+      }
+    } catch (err: unknown) {
+      if ((err as { name?: string })?.name === "AbortError") {
+        return;
+      }
+      upsertSwarmState(result.ticker, (current) => ({
+        requestId: result.request_id,
+        status: "error",
+        agents: current?.agents ?? {},
+        moderator: current?.moderator,
+        deliberationId: current?.deliberationId,
+        error: getErrorMessage(err),
+        interviewTurns: current?.interviewTurns ?? [],
+        logs: current?.logs ?? [],
+      }));
+      appendSwarmLog(result.ticker, result.request_id, {
+        kind: "error",
+        title: "Swarm analysis failed",
+        detail: getErrorMessage(err),
+      });
+    }
+  };
+
+  const askSwarmAgent = async () => {
+    if (!activeResult || !activeSwarm?.deliberationId || !interviewAgent || !interviewQuestion.trim()) {
+      return;
+    }
+
+    const question = interviewQuestion.trim();
+    setInterviewLoading(true);
+    upsertSwarmState(activeResult.ticker, (current) => ({
+      ...(current ?? {
+        requestId: activeResult.request_id,
+        status: "done",
+        agents: {},
+        interviewTurns: [],
+        logs: [],
+      }),
+      interviewTurns: [...(current?.interviewTurns ?? []), { role: "user", message: question }],
+    }));
+    appendSwarmLog(activeResult.ticker, activeResult.request_id, {
+      kind: "interview",
+      title: `Question for ${interviewAgent}`,
+      detail: question,
+    });
+
+    try {
+      const response = await fetch("/api/swarm/interview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          deliberation_id: activeSwarm.deliberationId,
+          agent: interviewAgent,
+          question,
+          history: activeSwarm.interviewTurns.map((turn) => ({
+            role: turn.role,
+            message: turn.message,
+          })),
+        }),
+      });
+      const payload = (await response.json()) as { answer?: string; error?: unknown };
+      if (!response.ok) {
+        throw new Error(getErrorMessage(payload.error));
+      }
+      upsertSwarmState(activeResult.ticker, (current) => ({
+        ...(current ?? {
+          requestId: activeResult.request_id,
+          status: "done",
+          agents: {},
+          interviewTurns: [],
+          logs: [],
+        }),
+        interviewTurns: [
+          ...(current?.interviewTurns ?? []),
+          { role: "agent", message: payload.answer ?? "No response returned." },
+        ],
+      }));
+      appendSwarmLog(activeResult.ticker, activeResult.request_id, {
+        kind: "interview",
+        title: `${interviewAgent} answered`,
+        detail: payload.answer ?? "No response returned.",
+        payload: { agent: interviewAgent },
+      });
+      setInterviewQuestion("");
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
+      appendSwarmLog(activeResult.ticker, activeResult.request_id, {
+        kind: "error",
+        title: "Interview request failed",
+        detail: getErrorMessage(err),
+        payload: { agent: interviewAgent },
+      });
+    } finally {
+      setInterviewLoading(false);
+    }
+  };
+
+  const runPredictEffect = useEffectEvent(() => {
+    void predict();
+  });
+
+  const runSwarmEffect = useEffectEvent((result: PredictionResult) => {
+    void startSwarmAnalysis(result);
+  });
 
   useEffect(() => {
     if (results.length === 0) {
@@ -1275,11 +1991,33 @@ export default function Home() {
     if (results.length > 0) return;
     if (tickers.length === 0) return;
     autoBootstrapped.current = true;
-    predict();
-  }, [loading, results.length, tickers.length]);
+    runPredictEffect();
+  }, [hydrated, loading, results.length, tickers.length]);
 
   const activeResult =
     results.find((result) => result.ticker === selectedTicker) ?? results[0] ?? null;
+  const activeSwarm = activeResult ? swarmByTicker[activeResult.ticker] ?? null : null;
+
+  useEffect(() => {
+    if (analysisMode !== "deep" || !activeResult) {
+      return;
+    }
+    const swarm = swarmByTicker[activeResult.ticker];
+    if (swarm?.requestId === activeResult.request_id && (swarm.status === "streaming" || swarm.status === "done")) {
+      return;
+    }
+    runSwarmEffect(activeResult);
+  }, [analysisMode, activeResult, swarmByTicker]);
+
+  useEffect(() => {
+    const availableAgents = Object.keys(activeSwarm?.agents ?? {});
+    if (availableAgents.length === 0) {
+      return;
+    }
+    if (!interviewAgent || !availableAgents.includes(interviewAgent)) {
+      setInterviewAgent(availableAgents[0]);
+    }
+  }, [activeSwarm, interviewAgent]);
 
   const activeFeatures = activeResult
     ? flattenFeatures(activeResult.feature_snapshot.groups)
@@ -1412,6 +2150,8 @@ export default function Home() {
 
     setLoading(true);
     setError(null);
+    Object.values(swarmAbortControllers.current).forEach((controller) => controller.abort());
+    swarmAbortControllers.current = {};
 
     try {
       const res = await fetch("/api/predict", {
@@ -1431,7 +2171,11 @@ export default function Home() {
         throw new Error(getErrorMessage(data.error) || `HTTP ${res.status}`);
       }
 
-      setResults(data.predictions ?? []);
+      const predictions = data.predictions ?? [];
+      setResults(predictions);
+      if (analysisMode === "quick") {
+        setSwarmByTicker({});
+      }
       if (session?.user?.email) {
         setTimeout(() => fetchHistory(), 1500);
       }
@@ -1440,6 +2184,9 @@ export default function Home() {
       setGroupFilter("all");
       setSortMode("group");
       setShowAllInputs(false);
+      if (analysisMode === "deep" && predictions.length > 0) {
+        void startSwarmAnalysis(predictions[0]);
+      }
     } catch (err: unknown) {
       setError(getErrorMessage(err));
     } finally {
@@ -1602,11 +2349,42 @@ export default function Home() {
                 </button>
               </div>
 
+              <div className="mt-4 inline-flex rounded-full border border-slate-200 bg-white/90 p-1">
+                <button
+                  onClick={() => setAnalysisMode("quick")}
+                  className={clsx(
+                    "rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition",
+                    analysisMode === "quick"
+                      ? "bg-slate-900 text-white"
+                      : "text-slate-600 hover:bg-slate-100",
+                  )}
+                >
+                  Quick Predict
+                </button>
+                <button
+                  onClick={() => setAnalysisMode("deep")}
+                  className={clsx(
+                    "rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition",
+                    analysisMode === "deep"
+                      ? "bg-[linear-gradient(135deg,#0f766e,#0b3b5a)] text-white"
+                      : "text-slate-600 hover:bg-slate-100",
+                  )}
+                >
+                  Deep Analysis
+                </button>
+              </div>
+
               {!session && (
                 <div className="mt-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
                   Predictions don’t require login. Sign in only to save history.
                 </div>
               )}
+
+              <div className="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                {analysisMode === "quick"
+                  ? "Quick Predict returns the ML ensemble result only."
+                  : "Deep Analysis keeps the ML result, then streams a four-agent review for the active ticker."}
+              </div>
 
               <div className="mt-5 flex flex-wrap gap-2">
                 {tickers.length === 0 ? (
@@ -2032,6 +2810,20 @@ export default function Home() {
                     </div>
 
                     <TopDriverCards driverFeatures={topDriverFeatures} />
+
+                    {analysisMode === "deep" && (
+                      <SwarmAnalysisPanel
+                        ticker={activeResult.ticker}
+                        swarm={activeSwarm}
+                        onRetry={() => void startSwarmAnalysis(activeResult)}
+                        onAsk={() => void askSwarmAgent()}
+                        interviewAgent={interviewAgent}
+                        setInterviewAgent={setInterviewAgent}
+                        interviewQuestion={interviewQuestion}
+                        setInterviewQuestion={setInterviewQuestion}
+                        interviewLoading={interviewLoading}
+                      />
+                    )}
 
                     <div className="rounded-[32px] border border-white/70 bg-white/80 p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)] backdrop-blur">
                       <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">

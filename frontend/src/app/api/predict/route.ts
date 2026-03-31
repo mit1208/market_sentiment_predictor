@@ -343,8 +343,15 @@ export async function POST(req: NextRequest) {
   const userEmail = session?.user?.email ?? null;
   if (userEmail) {
     try {
+      const rowsToLog = finalPredictions.filter(
+        (p) => typeof p.request_id === "string" && p.request_id && typeof p.ticker === "string" && p.ticker,
+      );
+      const skipped = finalPredictions.length - rowsToLog.length;
+      if (skipped > 0) {
+        console.warn(`Skipping ${skipped} prediction logs due to missing request_id or ticker.`);
+      }
       await Promise.all(
-        finalPredictions.map((p) => logUserPrediction(userEmail, p.request_id, p.ticker))
+        rowsToLog.map((p) => logUserPrediction(userEmail, p.request_id, p.ticker))
       );
     } catch (error) {
       console.error("Failed to log predictions to BigQuery:", error);
