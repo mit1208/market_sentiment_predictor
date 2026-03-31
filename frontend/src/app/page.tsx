@@ -710,6 +710,45 @@ function getSwarmLogTone(kind: SwarmLogEntry["kind"]): string {
   return "border-slate-200 bg-slate-50/90";
 }
 
+function getSwarmStatusLabel(status: SwarmTickerState["status"] | undefined): string {
+  if (status === "streaming") {
+    return "In progress";
+  }
+  if (status === "done") {
+    return "Ready";
+  }
+  if (status === "error") {
+    return "Needs attention";
+  }
+  return "Standing by";
+}
+
+function getSwarmStatusDetail(status: SwarmTickerState["status"] | undefined): string {
+  if (status === "streaming") {
+    return "The analyst bots are reviewing price action, news tone, and historical signals now.";
+  }
+  if (status === "done") {
+    return "You can review the debate, see the final call, and ask follow-up questions.";
+  }
+  if (status === "error") {
+    return "The last run did not finish cleanly. You can retry without losing the visible log.";
+  }
+  return "Run deep analysis when you want a slower, more conversational second opinion.";
+}
+
+function getSwarmLogEmoji(kind: SwarmLogEntry["kind"]): string {
+  if (kind === "error") {
+    return "⚠️";
+  }
+  if (kind === "interview") {
+    return "💬";
+  }
+  if (kind === "stream") {
+    return "🤖";
+  }
+  return "🫶";
+}
+
 function SwarmAnalysisPanel({
   ticker,
   swarm,
@@ -732,52 +771,64 @@ function SwarmAnalysisPanel({
   interviewLoading: boolean;
 }) {
   return (
-    <div className="rounded-[32px] border border-slate-200/70 bg-[linear-gradient(145deg,rgba(11,59,90,0.05),rgba(15,118,110,0.08),rgba(255,255,255,0.94))] p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)]">
-      <div className="flex flex-wrap items-start justify-between gap-4">
+    <div className="relative overflow-hidden rounded-[34px] border border-cyan-400/25 bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.22),transparent_34%),radial-gradient(circle_at_top_right,rgba(45,212,191,0.18),transparent_28%),linear-gradient(145deg,rgba(2,6,23,0.96),rgba(7,19,43,0.94),rgba(3,10,28,0.98))] p-5 text-white shadow-[0_34px_120px_-52px_rgba(8,145,178,0.55)]">
+      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(148,163,184,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.05)_1px,transparent_1px)] bg-[size:32px_32px] opacity-40" />
+      <div className="pointer-events-none absolute inset-x-6 top-0 h-px bg-gradient-to-r from-transparent via-cyan-300/70 to-transparent" />
+
+      <div className="relative flex flex-wrap items-start justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-            <Brain className="h-4 w-4 text-teal-700" />
+          <div className="flex items-center gap-2 text-sm font-semibold text-cyan-100">
+            <Brain className="h-4 w-4 text-cyan-300" />
             Swarm analysis
           </div>
-          <p className="mt-2 text-sm leading-6 text-slate-600">
-            Four analyst personas review the ML call for {ticker}, debate it in two rounds, and
-            then a deterministic moderator sets the final verdict.
+          <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-200/85">
+            Four analyst bots review the ML call for {ticker}, debate it in two rounds, and then
+            a moderator bot settles the final read.
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-600">
-            {swarm?.status === "streaming"
-              ? "Streaming"
-              : swarm?.status === "done"
-                ? "Complete"
-                : swarm?.status === "error"
-                  ? "Error"
-                  : "Idle"}
+          <span className="rounded-full border border-cyan-300/30 bg-cyan-400/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100">
+            {getSwarmStatusLabel(swarm?.status)}
           </span>
           <button
             onClick={onRetry}
-            className="rounded-full bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+            className="rounded-full border border-cyan-300/30 bg-[linear-gradient(135deg,rgba(34,211,238,0.28),rgba(59,130,246,0.28))] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110"
           >
             {swarm ? "Re-run analysis" : "Run analysis"}
           </button>
         </div>
       </div>
 
+      <div className="relative mt-4 rounded-[22px] border border-cyan-300/20 bg-white/8 px-4 py-3 backdrop-blur-md">
+        <div className="flex items-start gap-3">
+          <div className="text-lg leading-none">🤖</div>
+          <div>
+            <div className="text-sm font-semibold text-white">Live cockpit status</div>
+            <p className="mt-1 text-sm leading-6 text-slate-200/80">
+              {getSwarmStatusDetail(swarm?.status)}
+            </p>
+          </div>
+        </div>
+      </div>
+
       {swarm?.error && (
-        <div className="mt-4 rounded-[20px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+        <div className="mt-4 rounded-[20px] border border-rose-400/30 bg-rose-400/12 px-4 py-3 text-sm text-rose-100">
           {swarm.error}
         </div>
       )}
 
-      <div className="mt-5 grid gap-4 lg:grid-cols-2">
+      <div className="relative mt-5 grid gap-4 lg:grid-cols-2">
         {Object.values(swarm?.agents ?? {}).map((agent) => (
-          <div key={agent.agentId} className="rounded-[24px] border border-white/80 bg-white/85 p-4">
+          <div
+            key={agent.agentId}
+            className="rounded-[24px] border border-cyan-300/18 bg-[linear-gradient(180deg,rgba(255,255,255,0.10),rgba(255,255,255,0.04))] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_18px_50px_-36px_rgba(34,211,238,0.55)] backdrop-blur-md"
+          >
             <div className="flex items-center justify-between gap-3">
               <div>
-                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
-                  Analyst
+                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200/70">
+                  🤖 Analyst bot
                 </div>
-                <h3 className="mt-1 text-lg font-semibold text-slate-950">{agent.agent}</h3>
+                <h3 className="mt-1 text-lg font-semibold text-white">{agent.agent}</h3>
               </div>
               <div className="flex flex-wrap gap-2">
                 {agent.round2 && (
@@ -799,27 +850,27 @@ function SwarmAnalysisPanel({
             </div>
 
             <div className="mt-4 space-y-3">
-              <div className="rounded-[18px] border border-slate-200/70 bg-slate-50/70 p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
-                  Round 1
+              <div className="rounded-[18px] border border-white/10 bg-slate-950/30 p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-200/65">
+                  First read
                 </div>
-                <p className="mt-2 text-sm leading-6 text-slate-700">
+                <p className="mt-2 text-sm leading-6 text-slate-100/85">
                   {agent.round1?.thesis ?? "Waiting for first-pass verdict…"}
                 </p>
               </div>
-              <div className="rounded-[18px] border border-slate-200/70 bg-slate-50/70 p-3">
-                <div className="flex items-center justify-between gap-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
-                  <span>Round 2</span>
-                  {agent.round2?.revised && <span className="text-amber-700">Revised</span>}
+              <div className="rounded-[18px] border border-white/10 bg-slate-950/35 p-3">
+                <div className="flex items-center justify-between gap-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-200/65">
+                  <span>Final stance</span>
+                  {agent.round2?.revised && <span className="text-amber-300">Changed view</span>}
                 </div>
-                <p className="mt-2 text-sm leading-6 text-slate-700">
+                <p className="mt-2 text-sm leading-6 text-slate-100/85">
                   {agent.round2?.thesis ?? "Waiting for response round…"}
                 </p>
                 {agent.round2?.rebuttals && Object.keys(agent.round2.rebuttals).length > 0 && (
                   <div className="mt-3 space-y-2">
                     {Object.entries(agent.round2.rebuttals).map(([label, message]) => (
-                      <div key={label} className="rounded-[16px] border border-slate-200 bg-white px-3 py-2 text-xs leading-5 text-slate-600">
-                        <span className="font-semibold text-slate-800">{label}:</span> {message}
+                      <div key={label} className="rounded-[16px] border border-cyan-300/15 bg-white/6 px-3 py-2 text-xs leading-5 text-slate-200/80">
+                        <span className="font-semibold text-cyan-100">{label}:</span> {message}
                       </div>
                     ))}
                   </div>
@@ -828,7 +879,7 @@ function SwarmAnalysisPanel({
               {agent.round1?.key_signals && agent.round1.key_signals.length > 0 && (
                 <div className="flex flex-wrap gap-2">
                   {agent.round1.key_signals.map((signal) => (
-                    <span key={signal} className="rounded-full border border-teal-200 bg-teal-50 px-2.5 py-1 text-[11px] font-semibold text-teal-700">
+                    <span key={signal} className="rounded-full border border-cyan-300/25 bg-cyan-400/10 px-2.5 py-1 text-[11px] font-semibold text-cyan-100">
                       {signal}
                     </span>
                   ))}
@@ -840,18 +891,18 @@ function SwarmAnalysisPanel({
       </div>
 
       {swarm?.status === "streaming" && Object.keys(swarm.agents).length === 0 && (
-        <div className="mt-5 flex items-center gap-2 text-sm text-slate-500">
+        <div className="mt-5 flex items-center gap-2 text-sm text-cyan-100/80">
           <Loader2 className="h-4 w-4 animate-spin" />
-          Agents are forming initial positions…
+          Analyst bots are forming their first read…
         </div>
       )}
 
       {swarm?.moderator && (
-        <div className="mt-5 rounded-[24px] border border-slate-200/80 bg-slate-950 p-5 text-white">
+        <div className="mt-5 rounded-[24px] border border-fuchsia-300/20 bg-[linear-gradient(145deg,rgba(91,33,182,0.32),rgba(15,23,42,0.96),rgba(8,47,73,0.88))] p-5 text-white shadow-[0_24px_80px_-44px_rgba(168,85,247,0.55)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-white/60">
-                Moderator verdict
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-fuchsia-100/70">
+                🤖 Moderator bot verdict
               </div>
               <div className="mt-2 text-2xl font-semibold tracking-tight">
                 {swarm.moderator.final_direction} · {(swarm.moderator.final_confidence * 100).toFixed(1)}%
@@ -874,18 +925,18 @@ function SwarmAnalysisPanel({
         </div>
       )}
 
-      <div className="mt-5 rounded-[24px] border border-slate-200/70 bg-white/90 p-4">
+      <div className="mt-5 rounded-[24px] border border-cyan-300/18 bg-white/7 p-4 backdrop-blur-md">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-              <Activity className="h-4 w-4 text-slate-500" />
+            <div className="flex items-center gap-2 text-sm font-semibold text-white">
+              <Activity className="h-4 w-4 text-cyan-300" />
               Live swarm log
             </div>
-            <p className="mt-1 text-sm text-slate-600">
-              Every streamed event, system update, and analyst reply stays visible here.
+            <p className="mt-1 text-sm text-slate-200/75">
+              Every streamed event stays visible here so you never lose the reasoning trail.
             </p>
           </div>
-          <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+          <span className="rounded-full border border-cyan-300/20 bg-cyan-400/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100/90">
             {swarm?.logs.length ?? 0} entries
           </span>
         </div>
@@ -895,10 +946,13 @@ function SwarmAnalysisPanel({
             swarm.logs.map((entry) => (
               <div
                 key={entry.id}
-                className={clsx("rounded-[18px] border px-4 py-3", getSwarmLogTone(entry.kind))}
+                className={clsx("rounded-[18px] border px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]", getSwarmLogTone(entry.kind))}
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="text-sm font-semibold text-slate-900">{entry.title}</div>
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-950">
+                    <span>{getSwarmLogEmoji(entry.kind)}</span>
+                    <span>{entry.title}</span>
+                  </div>
                   <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
                     {formatSwarmLogTime(entry.at)}
                   </div>
@@ -917,7 +971,7 @@ function SwarmAnalysisPanel({
               </div>
             ))
           ) : (
-            <div className="rounded-[18px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-500">
+            <div className="rounded-[18px] border border-cyan-300/15 bg-white/6 px-4 py-3 text-sm text-slate-200/75">
               Swarm activity will appear here as soon as deep analysis starts.
             </div>
           )}
@@ -925,16 +979,19 @@ function SwarmAnalysisPanel({
       </div>
 
       {swarm?.deliberationId && (
-        <div className="mt-5 rounded-[24px] border border-slate-200/70 bg-white/85 p-4">
-          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-            <MessageSquare className="h-4 w-4 text-slate-500" />
-            Ask the analysts
+        <div className="mt-5 rounded-[24px] border border-cyan-300/18 bg-white/7 p-4 backdrop-blur-md">
+          <div className="flex items-center gap-2 text-sm font-semibold text-white">
+            <MessageSquare className="h-4 w-4 text-cyan-300" />
+            Ask the analyst bots
           </div>
+          <p className="mt-2 text-sm leading-6 text-slate-200/75">
+            Ask a plain-English follow-up like you would in a review meeting. The full exchange stays visible below.
+          </p>
           <div className="mt-3 grid gap-3 md:grid-cols-[180px_1fr_auto]">
             <select
               value={interviewAgent}
               onChange={(event) => setInterviewAgent(event.target.value)}
-              className="rounded-[18px] border border-slate-200 bg-white px-3 py-3 text-sm text-slate-900 outline-none"
+              className="rounded-[18px] border border-cyan-300/20 bg-slate-950/35 px-3 py-3 text-sm text-white outline-none"
             >
               {Object.values(swarm.agents).map((agent) => (
                 <option key={agent.agentId} value={agent.agentId}>
@@ -946,12 +1003,12 @@ function SwarmAnalysisPanel({
               value={interviewQuestion}
               onChange={(event) => setInterviewQuestion(event.target.value)}
               placeholder="Why did you challenge the model?"
-              className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none placeholder:text-slate-400"
+              className="rounded-[18px] border border-cyan-300/20 bg-slate-950/35 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-400"
             />
             <button
               onClick={onAsk}
               disabled={!interviewQuestion.trim() || interviewLoading}
-              className="rounded-[18px] bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+              className="rounded-[18px] border border-cyan-300/20 bg-[linear-gradient(135deg,rgba(45,212,191,0.28),rgba(59,130,246,0.30))] px-4 py-3 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {interviewLoading ? "Asking…" : "Ask"}
             </button>
@@ -964,12 +1021,12 @@ function SwarmAnalysisPanel({
                   className={clsx(
                     "rounded-[18px] px-4 py-3 text-sm leading-6",
                     turn.role === "user"
-                      ? "border border-slate-200 bg-slate-50 text-slate-700"
-                      : "border border-teal-200 bg-teal-50/70 text-slate-800",
+                      ? "border border-cyan-300/18 bg-white/10 text-slate-100"
+                      : "border border-teal-300/25 bg-teal-300/10 text-teal-50",
                   )}
                 >
-                  <span className="mr-2 font-semibold uppercase tracking-[0.14em] text-slate-500">
-                    {turn.role === "user" ? "You" : "Agent"}
+                  <span className="mr-2 font-semibold uppercase tracking-[0.14em] text-cyan-100/70">
+                    {turn.role === "user" ? "🧑 You" : "🤖 Bot"}
                   </span>
                   {turn.message}
                 </div>
@@ -1520,6 +1577,7 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
+  const [selectedResultKey, setSelectedResultKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [swarmByTicker, setSwarmByTicker] = useState<Record<string, SwarmTickerState>>({});
@@ -1973,16 +2031,23 @@ export default function Home() {
   useEffect(() => {
     if (results.length === 0) {
       setSelectedTicker((current) => current ?? tickers[0] ?? null);
+      setSelectedResultKey(null);
       return;
     }
 
-    setSelectedTicker((current) => {
-      if (current && results.some((result) => result.ticker === current)) {
-        return current;
-      }
-      return results[0]?.ticker ?? null;
-    });
-  }, [results, tickers]);
+    const preferred =
+      (selectedResultKey
+        ? results.find((result) => getResultKey(result) === selectedResultKey)
+        : null) ??
+      (selectedTicker
+        ? results.find((result) => result.ticker === selectedTicker)
+        : null) ??
+      results[0] ??
+      null;
+
+    setSelectedTicker(preferred?.ticker ?? null);
+    setSelectedResultKey(preferred ? getResultKey(preferred) : null);
+  }, [results, tickers, selectedResultKey, selectedTicker]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -1995,7 +2060,14 @@ export default function Home() {
   }, [hydrated, loading, results.length, tickers.length]);
 
   const activeResult =
-    results.find((result) => result.ticker === selectedTicker) ?? results[0] ?? null;
+    (selectedResultKey
+      ? results.find((result) => getResultKey(result) === selectedResultKey)
+      : null) ??
+    (selectedTicker
+      ? results.find((result) => result.ticker === selectedTicker)
+      : null) ??
+    results[0] ??
+    null;
   const activeSwarm = activeResult ? swarmByTicker[activeResult.ticker] ?? null : null;
 
   useEffect(() => {
@@ -2125,6 +2197,24 @@ export default function Home() {
     return baseTs ? formatRelativeTime(baseTs, nowMs) : "Pending";
   };
 
+  const getResultKey = (result: Pick<PredictionResult, "request_id" | "ticker">) =>
+    `${result.request_id}:${result.ticker}`;
+
+  function selectTicker(nextTicker: string) {
+    setSelectedTicker(nextTicker);
+    const matched = results.find((result) => result.ticker === nextTicker) ?? null;
+    setSelectedResultKey(matched ? getResultKey(matched) : null);
+    setInterviewQuestion("");
+    setError(null);
+  }
+
+  function selectResult(result: PredictionResult) {
+    setSelectedTicker(result.ticker);
+    setSelectedResultKey(getResultKey(result));
+    setInterviewQuestion("");
+    setError(null);
+  }
+
   function addTicker() {
     const normalized = normalizeTickerInput(ticker, exchange);
     if (!normalized || tickers.includes(normalized)) {
@@ -2173,6 +2263,8 @@ export default function Home() {
 
       const predictions = data.predictions ?? [];
       setResults(predictions);
+      setSelectedResultKey(predictions[0] ? getResultKey(predictions[0]) : null);
+      setSelectedTicker(predictions[0]?.ticker ?? null);
       if (analysisMode === "quick") {
         setSwarmByTicker({});
       }
@@ -2395,7 +2487,7 @@ export default function Home() {
                   tickers.map((tickerItem) => (
                     <button
                       key={tickerItem}
-                      onClick={() => setSelectedTicker(tickerItem)}
+                      onClick={() => selectTicker(tickerItem)}
                       className={clsx(
                         "inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm transition",
                         tickerItem === selectedTicker
@@ -2705,11 +2797,11 @@ export default function Home() {
               <div className="flex flex-wrap gap-2">
                 {results.map((result) => (
                   <button
-                    key={result.request_id}
-                    onClick={() => setSelectedTicker(result.ticker)}
+                    key={`${result.request_id}:${result.ticker}`}
+                    onClick={() => selectResult(result)}
                     className={clsx(
                       "rounded-full border px-4 py-2 text-sm transition",
-                      result.ticker === activeResult.ticker
+                      getResultKey(result) === getResultKey(activeResult)
                         ? "border-slate-900 bg-slate-900 text-white"
                         : "border-white/70 bg-white/80 text-slate-700 hover:bg-white",
                     )}
@@ -2724,7 +2816,7 @@ export default function Home() {
 
               <AnimatePresence mode="wait">
                 <motion.div
-                  key={activeResult.request_id}
+                  key={`${activeResult.request_id}:${activeResult.ticker}`}
                   initial={{ opacity: 0, y: 18 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -18 }}

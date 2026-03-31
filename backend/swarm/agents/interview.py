@@ -24,6 +24,11 @@ class InterviewService:
     def answer(self, request: SwarmInterviewRequest) -> SwarmInterviewResponse:
         deliberation = self.repository.get_deliberation(request.deliberation_id)
         rounds = deliberation.get("rounds") or []
+        summary = deliberation.get("summary") or {}
+        persona = next(
+            (persona for persona in self.repository.load_personas() if persona.agent_id == request.agent),
+            None,
+        )
         relevant = [
             verdict for verdict in rounds if verdict.get("agent_id") == request.agent
         ]
@@ -31,10 +36,14 @@ class InterviewService:
         answer = None
         if self.gemini.enabled:
             prompt = (
-                f"Answer as the {request.agent} agent.\n"
+                f"{persona.system_prompt if persona else f'Answer as the {request.agent} agent.'}\n\n"
+                f"Calibration context: {(persona.calibration_stats if persona else {})}\n"
                 f"Prior verdicts: {relevant}\n"
+                f"Moderator summary: {summary}\n"
                 f"Conversation history: {history}\n"
                 f"Question: {request.question}\n"
+                "Answer as this analyst, stay consistent with the stored deliberation, and explain"
+                " which features, sentiments, and risk signals mattered most.\n"
                 "Return structured JSON only."
             )
             payload = self.gemini.generate_json(prompt=prompt, response_schema=INTERVIEW_SCHEMA)
