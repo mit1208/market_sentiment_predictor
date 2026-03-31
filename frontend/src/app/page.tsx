@@ -243,6 +243,266 @@ function getErrorMessage(error: unknown): string {
   return "Prediction failed.";
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function getString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function getNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function getStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function sanitizeFeatureItem(value: unknown): FeatureItem | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const name = getString(value.name);
+  const label = getString(value.label) ?? name;
+  const source = getString(value.source) ?? "derived";
+
+  if (!name || !label) {
+    return null;
+  }
+
+  const rawValue = value.value;
+  const normalizedValue =
+    typeof rawValue === "number" || typeof rawValue === "string" || rawValue === null
+      ? rawValue
+      : null;
+
+  return {
+    name,
+    label,
+    value: normalizedValue,
+    source,
+    providers: getStringArray(value.providers),
+    raw_fields: getStringArray(value.raw_fields),
+    fallback_used: value.fallback_used === true,
+  };
+}
+
+function sanitizeFeatureGroups(value: unknown): FeatureGroup[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((group) => {
+    if (!isRecord(group)) {
+      return [];
+    }
+
+    const key = getString(group.key);
+    const label = getString(group.label) ?? key;
+    if (!key || !label) {
+      return [];
+    }
+
+    const features = Array.isArray(group.features)
+      ? group.features
+        .map((feature) => sanitizeFeatureItem(feature))
+        .filter((feature): feature is FeatureItem => Boolean(feature))
+      : [];
+
+    return [{ key, label, features }];
+  });
+}
+
+function sanitizeNewsItems(value: unknown): NewsItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item) => {
+    if (!isRecord(item)) {
+      return [];
+    }
+
+    const headline = getString(item.headline);
+    const source = getString(item.source) ?? "Unknown";
+    const provider = getString(item.provider) ?? source;
+    if (!headline) {
+      return [];
+    }
+
+    return [{
+      headline,
+      source,
+      provider,
+      url: getString(item.url),
+      published_at: getString(item.published_at),
+      sentiment_score: getNumber(item.sentiment_score),
+      magnitude: getNumber(item.magnitude),
+      category: getString(item.category),
+      scored_at: getString(item.scored_at),
+      sentiment_label: getString(item.sentiment_label),
+    }];
+  });
+}
+
+function sanitizeTopFeatures(value: unknown): ModelFeatureImportance[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item) => {
+    if (!isRecord(item)) {
+      return [];
+    }
+
+    const feature = getString(item.feature);
+    const importance = getNumber(item.importance);
+    if (!feature || importance === null) {
+      return [];
+    }
+
+    return [{ feature, importance }];
+  });
+}
+
+function sanitizePredictionResult(value: unknown): PredictionResult | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const ticker = getString(value.ticker)?.toUpperCase();
+  if (!ticker) {
+    return null;
+  }
+
+  const featureSnapshot = isRecord(value.feature_snapshot) ? value.feature_snapshot : {};
+  const groups = sanitizeFeatureGroups(featureSnapshot.groups);
+  const newsItems = sanitizeNewsItems(featureSnapshot.news_items);
+  const derivedFeatureCount = groups.reduce((sum, group) => sum + group.features.length, 0);
+  const modelQuality = isRecord(value.model_quality) ? value.model_quality : null;
+
+  return {
+    request_id: getString(value.request_id) ?? `${ticker}-${getString(value.predicted_at) ?? "cached"}`,
+    ticker,
+    prediction: value.prediction === "Up" ? "Up" : "Down",
+    confidence: getNumber(value.confidence) ?? 0,
+    prob_up: getNumber(value.prob_up) ?? 0,
+    as_of: getString(value.as_of) ?? "",
+    predicted_at: getString(value.predicted_at) ?? "",
+    model_artifact_uri: getString(value.model_artifact_uri),
+    model_trained_at: getString(value.model_trained_at),
+    model_quality: modelQuality
+      ? {
+        score_semantics: getString(modelQuality.score_semantics) ?? undefined,
+        cv_accuracy_mean: getNumber(modelQuality.cv_accuracy_mean),
+        cv_auc_mean: getNumber(modelQuality.cv_auc_mean),
+        holdout_accuracy: getNumber(modelQuality.holdout_accuracy),
+        holdout_auc: getNumber(modelQuality.holdout_auc),
+        used_feature_count: getNumber(modelQuality.used_feature_count) ?? undefined,
+        zero_importance_feature_count:
+          getNumber(modelQuality.zero_importance_feature_count) ?? undefined,
+        top_features: sanitizeTopFeatures(modelQuality.top_features),
+        feature_selection_source: getString(modelQuality.feature_selection_source),
+        feature_selection_mode: getString(modelQuality.feature_selection_mode),
+        feature_selection_is_temporary: modelQuality.feature_selection_is_temporary === true,
+      }
+      : null,
+    feature_snapshot: {
+      as_of: getString(featureSnapshot.as_of) ?? "",
+      company_name: getString(featureSnapshot.company_name),
+      quote_currency: getString(featureSnapshot.quote_currency),
+      feature_count: getNumber(featureSnapshot.feature_count) ?? derivedFeatureCount,
+      selected_feature_count: getNumber(featureSnapshot.selected_feature_count) ?? undefined,
+      headlines_text: getString(featureSnapshot.headlines_text) ?? undefined,
+      groups,
+      news_items: newsItems,
+      cache_status: isRecord(featureSnapshot.cache_status)
+        ? {
+          source_mode: getString(featureSnapshot.cache_status.source_mode) ?? "unknown",
+          reason: getString(featureSnapshot.cache_status.reason) ?? "Unavailable",
+          cache_hit: featureSnapshot.cache_status.cache_hit === true,
+          stale_served: featureSnapshot.cache_status.stale_served === true,
+          quota_exhausted: featureSnapshot.cache_status.quota_exhausted === true,
+          snapshot_timestamp: getString(featureSnapshot.cache_status.snapshot_timestamp),
+          snapshot_age_seconds: getNumber(featureSnapshot.cache_status.snapshot_age_seconds),
+          snapshot_age_minutes: getNumber(featureSnapshot.cache_status.snapshot_age_minutes),
+          fresh_ttl_seconds: getNumber(featureSnapshot.cache_status.fresh_ttl_seconds),
+          fresh_ttl_minutes: getNumber(featureSnapshot.cache_status.fresh_ttl_minutes),
+          max_stale_ttl_seconds: getNumber(featureSnapshot.cache_status.max_stale_ttl_seconds),
+          max_stale_ttl_minutes: getNumber(featureSnapshot.cache_status.max_stale_ttl_minutes),
+          daily_live_fetch_limit: getNumber(featureSnapshot.cache_status.daily_live_fetch_limit),
+          daily_live_fetch_count: getNumber(featureSnapshot.cache_status.daily_live_fetch_count),
+          daily_live_fetch_remaining: getNumber(
+            featureSnapshot.cache_status.daily_live_fetch_remaining,
+          ),
+          origin_snapshot_id: getString(featureSnapshot.cache_status.origin_snapshot_id),
+          origin_request_id: getString(featureSnapshot.cache_status.origin_request_id),
+        }
+        : null,
+      provider_summary: isRecord(featureSnapshot.provider_summary)
+        ? {
+          finnhub: getNumber(featureSnapshot.provider_summary.finnhub) ?? undefined,
+          yahoo: getNumber(featureSnapshot.provider_summary.yahoo) ?? undefined,
+          derived: getNumber(featureSnapshot.provider_summary.derived) ?? undefined,
+          fallback_fields:
+            getNumber(featureSnapshot.provider_summary.fallback_fields) ?? undefined,
+        }
+        : undefined,
+    },
+  };
+}
+
+function sanitizePredictionResults(value: unknown): PredictionResult[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => sanitizePredictionResult(item))
+    .filter((item): item is PredictionResult => Boolean(item));
+}
+
+function sanitizeHistoryItem(value: unknown): HistoryItem | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const ticker = getString(value.ticker)?.toUpperCase();
+  if (!ticker) {
+    return null;
+  }
+
+  return {
+    request_id: getString(value.request_id) ?? `${ticker}-history`,
+    ticker,
+    prediction: getString(value.prediction) ?? "Pending",
+    prob_up: getNumber(value.prob_up) ?? 0,
+    confidence: getNumber(value.confidence) ?? 0,
+    current_price: getNumber(value.current_price),
+    headline_count: getNumber(value.headline_count),
+    predicted_at: getString(value.predicted_at) ?? "",
+    snapshot_timestamp: getString(value.snapshot_timestamp),
+    feature_snapshot: isRecord(value.feature_snapshot) ? value.feature_snapshot : {},
+    model_artifact_uri: getString(value.model_artifact_uri),
+  };
+}
+
+function sanitizeHistoryItems(value: unknown): HistoryItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => sanitizeHistoryItem(item))
+    .filter((item): item is HistoryItem => Boolean(item));
+}
+
 function flattenFeatures(groups: FeatureGroup[]): FeatureRow[] {
   return groups.flatMap((group) =>
     group.features.map((feature) => ({
@@ -1598,6 +1858,10 @@ export default function Home() {
   const autoBootstrapped = useRef(false);
   const swarmAbortControllers = useRef<Record<string, AbortController>>({});
 
+  function getResultKey(result: Pick<PredictionResult, "request_id" | "ticker">) {
+    return `${result.request_id}:${result.ticker}`;
+  }
+
   useEffect(() => {
     if (typeof window === "undefined") return;
     try {
@@ -1605,9 +1869,7 @@ export default function Home() {
       const storedTicker = window.localStorage.getItem("selectedTicker");
       if (storedResults) {
         const parsed = JSON.parse(storedResults);
-        if (Array.isArray(parsed)) {
-          setResults(parsed as PredictionResult[]);
-        }
+        setResults(sanitizePredictionResults(parsed));
       }
       if (storedTicker) {
         setSelectedTicker(storedTicker);
@@ -1671,7 +1933,7 @@ export default function Home() {
       const res = await fetch("/api/history");
       if (res.ok) {
         const data = await res.json();
-        setHistory(data.history || []);
+        setHistory(sanitizeHistoryItems(data.history));
       }
     } catch (err) {
       console.error("Failed to fetch history:", err);
@@ -2197,9 +2459,6 @@ export default function Home() {
     return baseTs ? formatRelativeTime(baseTs, nowMs) : "Pending";
   };
 
-  const getResultKey = (result: Pick<PredictionResult, "request_id" | "ticker">) =>
-    `${result.request_id}:${result.ticker}`;
-
   function selectTicker(nextTicker: string) {
     setSelectedTicker(nextTicker);
     const matched = results.find((result) => result.ticker === nextTicker) ?? null;
@@ -2261,7 +2520,7 @@ export default function Home() {
         throw new Error(getErrorMessage(data.error) || `HTTP ${res.status}`);
       }
 
-      const predictions = data.predictions ?? [];
+      const predictions = sanitizePredictionResults(data.predictions);
       setResults(predictions);
       setSelectedResultKey(predictions[0] ? getResultKey(predictions[0]) : null);
       setSelectedTicker(predictions[0]?.ticker ?? null);
