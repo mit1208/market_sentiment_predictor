@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 from backend.swarm.config import GEMINI_API_KEY, GEMINI_MODEL
 
@@ -28,7 +28,7 @@ class GeminiSwarmClient:
         *,
         prompt: str,
         response_schema: dict[str, Any],
-    ) -> dict[str, Any] | None:
+    ) -> Optional[dict[str, Any]]:
         if not self._client:
             return None
 
