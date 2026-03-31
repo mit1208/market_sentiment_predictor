@@ -16,6 +16,8 @@ def test_moderator_keeps_model_direction_without_supermajority():
             conviction="medium",
             thesis="Supportive sentiment backdrop.",
             agrees_with_model=True,
+            ml_direction="Up",
+            ml_confidence=0.7,
         ),
         AgentVerdict(
             deliberation_id="delib:AAPL:1",
@@ -29,6 +31,8 @@ def test_moderator_keeps_model_direction_without_supermajority():
             conviction="high",
             thesis="Macro tape is soft.",
             agrees_with_model=False,
+            ml_direction="Up",
+            ml_confidence=0.7,
         ),
     ]
     summary = moderate(
@@ -62,6 +66,8 @@ def test_moderator_overrides_on_high_conviction_supermajority():
                 conviction="high" if idx < 2 else "medium",
                 thesis="Stress signal.",
                 agrees_with_model=False if idx < 3 else True,
+                ml_direction="Up",
+                ml_confidence=0.72,
             )
         )
     summary = moderate(

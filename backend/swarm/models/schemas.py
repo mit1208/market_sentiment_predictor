@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -54,8 +54,8 @@ class AgentVerdict(BaseModel):
     revised: bool = False
     ml_direction: Literal["Up", "Down"]
     ml_confidence: float
-    actual_outcome: str | None = None
-    agent_was_correct: bool | None = None
+    actual_outcome: Optional[str] = None
+    agent_was_correct: Optional[bool] = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -67,8 +67,8 @@ class ModeratorVerdict(BaseModel):
     final_confidence: float
     direction_overridden: bool
     consensus: str
-    dissent: str | None = None
-    actual_outcome: str | None = None
+    dissent: Optional[str] = None
+    actual_outcome: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
