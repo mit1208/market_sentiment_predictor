@@ -14,8 +14,8 @@ export async function GET() {
       signed_in: false,
       prediction_count: 0,
       daily_limit: FREE_DAILY_LIMIT,
-      remaining: 0,
-      limit_reached: true,
+      remaining: FREE_DAILY_LIMIT,
+      limit_reached: false,
     });
   }
 

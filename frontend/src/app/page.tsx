@@ -2555,11 +2555,6 @@ export default function Home() {
       return;
     }
 
-    if (!session?.user?.email) {
-      signIn("google");
-      return;
-    }
-
     setLoading(true);
     setError(null);
     Object.values(swarmAbortControllers.current).forEach((controller) => controller.abort());
@@ -2577,14 +2572,8 @@ export default function Home() {
       const data = (await res.json()) as {
         predictions?: PredictionResult[];
         error?: unknown;
-        require_auth?: boolean;
         limit_reached?: boolean;
       };
-
-      if (data.require_auth) {
-        signIn("google");
-        return;
-      }
 
       if (!res.ok) {
         throw new Error(getErrorMessage(data.error) || `HTTP ${res.status}`);
@@ -2755,22 +2744,12 @@ export default function Home() {
                 <button
                   onClick={predict}
                   disabled={tickers.length === 0 || loading || !!(session && usageLoaded && usageCount >= usageLimit)}
-                  className={clsx(
-                    "inline-flex items-center justify-center gap-2 rounded-[28px] px-5 py-4 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40",
-                    !session
-                      ? "bg-[linear-gradient(135deg,#7c3aed,#4f46e5)] text-white hover:brightness-110"
-                      : "bg-[linear-gradient(135deg,#0f766e,#0b3b5a)] text-white hover:brightness-105",
-                  )}
+                  className="inline-flex items-center justify-center gap-2 rounded-[28px] bg-[linear-gradient(135deg,#0f766e,#0b3b5a)] px-5 py-4 text-sm font-semibold text-white transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   {loading ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
                       Refreshing live frame
-                    </>
-                  ) : !session ? (
-                    <>
-                      <LogIn className="h-4 w-4" />
-                      Sign in to predict
                     </>
                   ) : usageLoaded && usageCount >= usageLimit ? (
                     <>
@@ -2818,8 +2797,8 @@ export default function Home() {
                       <LogIn className="h-5 w-5 text-violet-600" />
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-slate-900">Sign in to get started</p>
-                      <p className="text-xs text-slate-500">Free users get {usageLimit} predictions per day. Upgrade for unlimited access.</p>
+                      <p className="text-sm font-semibold text-slate-900">Sign in to save your workspace</p>
+                      <p className="text-xs text-slate-500">Predictions still run without login. Signing in keeps history, usage tracking, and feedback tied to your account.</p>
                     </div>
                     <button
                       onClick={() => signIn("google")}
