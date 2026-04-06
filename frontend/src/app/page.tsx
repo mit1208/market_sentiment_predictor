@@ -141,7 +141,12 @@ type AnalysisMode = "quick" | "deep";
 type SourceFilter = "all" | "finnhub" | "yahoo" | "derived";
 type SortMode = "group" | "value" | "source";
 type Exchange = "NYSE" | "TSX";
-const DEFAULT_TICKERS: string[] = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"];
+const DEFAULT_TICKERS: string[] = ["SPY", "QQQ", "AAPL"];
+const FREE_TICKER_LIMIT = 3;
+
+function isDefaultTicker(ticker: string) {
+  return DEFAULT_TICKERS.includes(ticker);
+}
 
 interface SwarmVerdictEvent {
   direction: "Up" | "Down";
@@ -189,6 +194,7 @@ interface SwarmTickerState {
   requestId: string;
   status: "idle" | "streaming" | "done" | "error";
   deliberationId?: string;
+  source?: "live" | "archive";
   agents: Record<string, SwarmAgentState>;
   moderator?: SwarmModeratorVerdict;
   error?: string;
@@ -208,7 +214,14 @@ interface HistoryItem {
   snapshot_timestamp?: string | null;
   feature_snapshot: Record<string, unknown>;
   model_artifact_uri?: string | null;
+  swarm_deliberation_id?: string | null;
+  swarm_final_direction?: string | null;
+  swarm_final_confidence?: number | null;
+  swarm_consensus?: string | null;
+  swarm_created_at?: string | null;
 }
+
+type SwarmRoundView = "round1" | "round2" | "final";
 
 interface FeatureRow extends FeatureItem {
   groupKey: string;
@@ -495,6 +508,11 @@ function sanitizeHistoryItem(value: unknown): HistoryItem | null {
     snapshot_timestamp: getString(value.snapshot_timestamp),
     feature_snapshot: isRecord(value.feature_snapshot) ? value.feature_snapshot : {},
     model_artifact_uri: getString(value.model_artifact_uri),
+    swarm_deliberation_id: getString(value.swarm_deliberation_id),
+    swarm_final_direction: getString(value.swarm_final_direction),
+    swarm_final_confidence: getNumber(value.swarm_final_confidence),
+    swarm_consensus: getString(value.swarm_consensus),
+    swarm_created_at: getString(value.swarm_created_at),
   };
 }
 
@@ -506,6 +524,157 @@ function sanitizeHistoryItems(value: unknown): HistoryItem[] {
   return value
     .map((item) => sanitizeHistoryItem(item))
     .filter((item): item is HistoryItem => Boolean(item));
+}
+
+function buildHistoryKey(item: Pick<HistoryItem, "request_id" | "ticker">): string {
+  return `${item.request_id}:${item.ticker}`;
+}
+
+function buildSwarmReplayState(value: unknown): SwarmTickerState | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const getReplayLogEntry = (
+    eventName: string,
+    payload: Record<string, unknown>,
+  ): Pick<SwarmLogEntry, "kind" | "title" | "detail"> => {
+    if (eventName === "round1_verdict") {
+      return {
+        kind: "stream",
+        title: `${String(payload.agent ?? "Agent")} · Round 1`,
+        detail: `${String(payload.direction ?? "Pending")} with ${String(payload.conviction ?? "unknown")} conviction. ${String(payload.thesis ?? "")}`,
+      };
+    }
+    if (eventName === "round2_verdict") {
+      return {
+        kind: "stream",
+        title: `${String(payload.agent ?? "Agent")} · Round 2`,
+        detail: `${payload.revised ? "Revised view." : "Held position."} ${String(payload.direction ?? "Pending")} with ${String(payload.conviction ?? "unknown")} conviction. ${String(payload.thesis ?? "")}`,
+      };
+    }
+    if (eventName === "moderator_verdict") {
+      return {
+        kind: "stream",
+        title: "Moderator verdict",
+        detail: `${String(payload.final_direction ?? "Pending")} at ${typeof payload.final_confidence === "number" ? `${((payload.final_confidence as number) * 100).toFixed(1)}%` : "unknown confidence"}. ${String(payload.consensus ?? "")}`,
+      };
+    }
+    return {
+      kind: "system",
+      title: "Swarm analysis complete",
+      detail: `Deliberation ${String(payload.deliberation_id ?? "")} is ready for replay and follow-up questions.`,
+    };
+  };
+
+  const deliberationId = getString(value.deliberation_id) ?? undefined;
+  const summary = isRecord(value.summary) ? value.summary : null;
+  const rounds = Array.isArray(value.rounds) ? value.rounds.filter(isRecord) : [];
+  const agents: Record<string, SwarmAgentState> = {};
+  const logs: SwarmLogEntry[] = [];
+  let requestId = summary ? getString(summary.request_id) ?? "" : "";
+
+  rounds.forEach((round, index) => {
+    const agentId = getString(round.agent_id) ?? `agent-${index}`;
+    const agentLabel = getString(round.display_name) ?? getString(round.agent) ?? agentId;
+    const agentState = agents[agentId] ?? { agentId, agent: agentLabel };
+    const roundNumber = getNumber(round.round);
+    const eventName = roundNumber === 2 ? "round2_verdict" : "round1_verdict";
+    const payload = {
+      agent_id: agentId,
+      agent: agentLabel,
+      direction: getString(round.direction) ?? "Up",
+      conviction: getString(round.conviction) ?? "medium",
+      thesis: getString(round.thesis) ?? "",
+      key_signals: Array.isArray(round.key_signals) ? round.key_signals : [],
+      rebuttals: isRecord(round.rebuttals) ? round.rebuttals : {},
+      agrees_with_model: round.agrees_with_model === true,
+      revised: round.revised === true,
+    } satisfies Record<string, unknown>;
+
+    const verdict: SwarmVerdictEvent = {
+      direction: (getString(round.direction) ?? "Up") as "Up" | "Down",
+      conviction: (getString(round.conviction) ?? "medium") as "low" | "medium" | "high",
+      thesis: getString(round.thesis) ?? "",
+      agrees_with_model: round.agrees_with_model === true,
+      key_signals: Array.isArray(round.key_signals)
+        ? round.key_signals.map((signal) => String(signal))
+        : undefined,
+      rebuttals: isRecord(round.rebuttals)
+        ? Object.fromEntries(Object.entries(round.rebuttals).map(([key, val]) => [key, String(val)]))
+        : undefined,
+      revised: round.revised === true,
+    };
+
+    if (roundNumber === 2) {
+      agentState.round2 = verdict;
+    } else {
+      agentState.round1 = verdict;
+    }
+    agents[agentId] = agentState;
+    requestId ||= getString(round.request_id) ?? "";
+    const logEntry = getReplayLogEntry(eventName, payload);
+    logs.push({
+      id: `${deliberationId ?? "delib"}-${eventName}-${agentId}-${index}`,
+      at: getString(round.created_at) ?? new Date().toISOString(),
+      kind: logEntry.kind,
+      title: logEntry.title,
+      detail: logEntry.detail,
+      payload,
+    });
+  });
+
+  const moderator = summary
+    ? {
+      deliberation_id: getString(summary.deliberation_id) ?? deliberationId ?? "",
+      request_id: getString(summary.request_id) ?? requestId,
+      ticker: getString(summary.ticker) ?? "",
+      final_direction: (getString(summary.final_direction) ?? "Up") as "Up" | "Down",
+      final_confidence: getNumber(summary.final_confidence) ?? 0,
+      direction_overridden: summary.direction_overridden === true,
+      consensus: getString(summary.consensus) ?? "Consensus pending",
+      dissent: getString(summary.dissent),
+    } satisfies SwarmModeratorVerdict
+    : undefined;
+
+  if (moderator) {
+    const moderatorPayload = {
+      final_direction: moderator.final_direction,
+      final_confidence: moderator.final_confidence,
+      consensus: moderator.consensus,
+      direction_overridden: moderator.direction_overridden,
+      deliberation_id: moderator.deliberation_id,
+    } satisfies Record<string, unknown>;
+    const moderatorLog = getReplayLogEntry("moderator_verdict", moderatorPayload);
+    logs.push({
+      id: `${moderator.deliberation_id}-moderator`,
+      at: getString(summary?.created_at) ?? new Date().toISOString(),
+      kind: moderatorLog.kind,
+      title: moderatorLog.title,
+      detail: moderatorLog.detail,
+      payload: moderatorPayload,
+    });
+    const doneLog = getReplayLogEntry("done", { deliberation_id: moderator.deliberation_id });
+    logs.push({
+      id: `${moderator.deliberation_id}-done`,
+      at: getString(summary?.created_at) ?? new Date().toISOString(),
+      kind: doneLog.kind,
+      title: doneLog.title,
+      detail: doneLog.detail,
+      payload: { deliberation_id: moderator.deliberation_id },
+    });
+  }
+
+  return {
+    requestId,
+    status: moderator || Object.keys(agents).length > 0 ? "done" : "idle",
+    deliberationId,
+    source: "archive",
+    agents,
+    moderator,
+    interviewTurns: [],
+    logs,
+  };
 }
 
 function flattenFeatures(groups: FeatureGroup[]): FeatureRow[] {
@@ -789,7 +958,7 @@ function getCacheTone(cacheStatus: CacheStatus | null | undefined) {
       label: "Live API",
       chipClasses: "border-teal-200 bg-teal-50 text-teal-700",
       summary:
-        "This prediction refreshed live market and news inputs directly from upstream providers.",
+        "This prediction used live market and news inputs directly from upstream providers.",
     };
   }
 
@@ -1024,17 +1193,151 @@ function SwarmAnalysisPanel({
   interviewQuestion,
   setInterviewQuestion,
   interviewLoading,
+  variant = "live",
+  archivedAt,
+  nowMs,
 }: {
   ticker: string;
   swarm: SwarmTickerState | null;
-  onRetry: () => void;
-  onAsk: () => void;
-  interviewAgent: string;
-  setInterviewAgent: (value: string) => void;
-  interviewQuestion: string;
-  setInterviewQuestion: (value: string) => void;
-  interviewLoading: boolean;
+  onRetry?: () => void;
+  onAsk?: () => void;
+  interviewAgent?: string;
+  setInterviewAgent?: (value: string) => void;
+  interviewQuestion?: string;
+  setInterviewQuestion?: (value: string) => void;
+  interviewLoading?: boolean;
+  variant?: "live" | "archive";
+  archivedAt?: string | null;
+  nowMs?: number;
 }) {
+  const [selectedRoundOverride, setSelectedRoundOverride] = useState<SwarmRoundView | null>(null);
+  const agents = Object.values(swarm?.agents ?? {});
+  const hasRound2 = agents.some((agent) => Boolean(agent.round2));
+  const hasFinal = Boolean(swarm?.moderator);
+  const round1Count = agents.filter((agent) => Boolean(agent.round1)).length;
+  const round2Count = agents.filter((agent) => Boolean(agent.round2)).length;
+  const selectedRound = selectedRoundOverride ?? (hasFinal ? "final" : hasRound2 ? "round2" : "round1");
+  const showAskPanel =
+    variant === "live" &&
+    Boolean(swarm?.deliberationId && onAsk && setInterviewAgent && setInterviewQuestion);
+
+  const renderAgentCard = (agent: SwarmAgentState, round: SwarmRoundView) => {
+    if (round === "final") {
+      const finalVerdict = agent.round2 ?? agent.round1;
+      return (
+        <div
+          key={`${agent.agentId}-final`}
+          className="rounded-[24px] border border-cyan-300/18 bg-[linear-gradient(180deg,rgba(255,255,255,0.10),rgba(255,255,255,0.04))] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_18px_50px_-36px_rgba(34,211,238,0.55)] backdrop-blur-md"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200/70">
+                Analyst
+              </div>
+              <h3 className="mt-1 text-lg font-semibold text-white">{agent.agent}</h3>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {finalVerdict && (
+                <span className={clsx("rounded-full border px-2.5 py-1 text-[11px] font-semibold", getConvictionClasses(finalVerdict.conviction))}>
+                  {finalVerdict.conviction}
+                </span>
+              )}
+              <span
+                className={clsx(
+                  "rounded-full px-2.5 py-1 text-[11px] font-semibold",
+                  (finalVerdict?.direction ?? "Up") === "Up"
+                    ? "bg-emerald-50 text-emerald-700"
+                    : "bg-rose-50 text-rose-700",
+                )}
+              >
+                {finalVerdict?.direction ?? "Pending"}
+              </span>
+            </div>
+          </div>
+
+          <div className="mt-4 rounded-[18px] border border-white/10 bg-slate-950/35 p-3">
+            <div className="flex items-center justify-between gap-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-200/65">
+              <span>Closing position</span>
+              {agent.round2?.revised && <span className="text-amber-300">Changed view</span>}
+            </div>
+            <p className="mt-2 text-sm leading-6 text-slate-100/85">
+              {finalVerdict?.thesis ?? "Waiting for final stance…"}
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    const verdict = round === "round2" ? agent.round2 : agent.round1;
+    const heading = round === "round2" ? "Round 2 response" : "Round 1 opening";
+    const emptyCopy = round === "round2" ? "Waiting for the rebuttal round…" : "Waiting for first-pass verdict…";
+
+    return (
+      <div
+        key={`${agent.agentId}-${round}`}
+        className="rounded-[24px] border border-cyan-300/18 bg-[linear-gradient(180deg,rgba(255,255,255,0.10),rgba(255,255,255,0.04))] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_18px_50px_-36px_rgba(34,211,238,0.55)] backdrop-blur-md"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200/70">
+              Analyst
+            </div>
+            <h3 className="mt-1 text-lg font-semibold text-white">{agent.agent}</h3>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {verdict && (
+              <span className={clsx("rounded-full border px-2.5 py-1 text-[11px] font-semibold", getConvictionClasses(verdict.conviction))}>
+                {verdict.conviction}
+              </span>
+            )}
+            <span
+              className={clsx(
+                "rounded-full px-2.5 py-1 text-[11px] font-semibold",
+                (verdict?.direction ?? "Up") === "Up"
+                  ? "bg-emerald-50 text-emerald-700"
+                  : "bg-rose-50 text-rose-700",
+              )}
+            >
+              {verdict?.direction ?? "Pending"}
+            </span>
+          </div>
+        </div>
+
+        <div className="mt-4 space-y-3">
+          <div className="rounded-[18px] border border-white/10 bg-slate-950/35 p-3">
+            <div className="flex items-center justify-between gap-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-200/65">
+              <span>{heading}</span>
+              {round === "round2" && verdict?.revised && <span className="text-amber-300">Changed view</span>}
+            </div>
+            <p className="mt-2 text-sm leading-6 text-slate-100/85">
+              {verdict?.thesis ?? emptyCopy}
+            </p>
+          </div>
+
+          {round === "round1" && agent.round1?.key_signals && agent.round1.key_signals.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {agent.round1.key_signals.map((signal) => (
+                <span key={signal} className="rounded-full border border-cyan-300/25 bg-cyan-400/10 px-2.5 py-1 text-[11px] font-semibold text-cyan-100">
+                  {signal}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {round === "round2" && agent.round2?.rebuttals && Object.keys(agent.round2.rebuttals).length > 0 && (
+            <div className="space-y-2">
+              {Object.entries(agent.round2.rebuttals).map(([label, message]) => (
+                <div key={label} className="rounded-[16px] border border-cyan-300/15 bg-white/6 px-3 py-2 text-xs leading-5 text-slate-200/80">
+                  <span className="font-semibold text-cyan-100">{label}:</span> {message}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="relative overflow-hidden rounded-[34px] border border-cyan-400/25 bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.22),transparent_34%),radial-gradient(circle_at_top_right,rgba(45,212,191,0.18),transparent_28%),linear-gradient(145deg,rgba(2,6,23,0.96),rgba(7,19,43,0.94),rgba(3,10,28,0.98))] p-5 text-white shadow-[0_34px_120px_-52px_rgba(8,145,178,0.55)]">
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(148,163,184,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.05)_1px,transparent_1px)] bg-[size:32px_32px] opacity-40" />
@@ -1044,33 +1347,44 @@ function SwarmAnalysisPanel({
         <div>
           <div className="flex items-center gap-2 text-sm font-semibold text-cyan-100">
             <Brain className="h-4 w-4 text-cyan-300" />
-            Swarm analysis
+            {variant === "archive" ? "Deep analysis archive" : "Swarm analysis"}
           </div>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-200/85">
             Four analyst bots review the ML call for {ticker}, debate it in two rounds, and then
-            a moderator bot settles the final read.
+            a moderator bot settles the final read. Pick a round to replay the discussion as it unfolds.
           </p>
         </div>
         <div className="flex items-center gap-2">
           <span className="rounded-full border border-cyan-300/30 bg-cyan-400/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100">
+            {swarm?.source === "archive" ? "Archive replay" : "Live stream"}
+          </span>
+          <span className="rounded-full border border-cyan-300/30 bg-cyan-400/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100">
             {getSwarmStatusLabel(swarm?.status)}
           </span>
-          <button
-            onClick={onRetry}
-            className="rounded-full border border-cyan-300/30 bg-[linear-gradient(135deg,rgba(34,211,238,0.28),rgba(59,130,246,0.28))] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110"
-          >
-            {swarm ? "Re-run analysis" : "Run analysis"}
-          </button>
+          {archivedAt && (
+            <span className="rounded-full border border-cyan-300/20 bg-white/8 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-200/90">
+              saved {formatRelativeTime(archivedAt, nowMs ?? 0)}
+            </span>
+          )}
+          {onRetry && (
+            <button
+              onClick={onRetry}
+              className="rounded-full border border-cyan-300/30 bg-[linear-gradient(135deg,rgba(34,211,238,0.28),rgba(59,130,246,0.28))] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110"
+            >
+              {variant === "archive" ? "Run fresh analysis" : swarm ? "Re-run analysis" : "Run analysis"}
+            </button>
+          )}
         </div>
       </div>
 
       <div className="relative mt-4 rounded-[22px] border border-cyan-300/20 bg-white/8 px-4 py-3 backdrop-blur-md">
         <div className="flex items-start gap-3">
-          <div className="text-lg leading-none">🤖</div>
           <div>
             <div className="text-sm font-semibold text-white">Live cockpit status</div>
             <p className="mt-1 text-sm leading-6 text-slate-200/80">
-              {getSwarmStatusDetail(swarm?.status)}
+              {swarm?.source === "archive"
+                ? "This is a saved deep-analysis replay linked to an earlier prediction. You can inspect every round without triggering a new model call."
+                : getSwarmStatusDetail(swarm?.status)}
             </p>
           </div>
         </div>
@@ -1082,77 +1396,63 @@ function SwarmAnalysisPanel({
         </div>
       )}
 
-      <div className="relative mt-5 grid gap-4 lg:grid-cols-2">
-        {Object.values(swarm?.agents ?? {}).map((agent) => (
-          <div
-            key={agent.agentId}
-            className="rounded-[24px] border border-cyan-300/18 bg-[linear-gradient(180deg,rgba(255,255,255,0.10),rgba(255,255,255,0.04))] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_18px_50px_-36px_rgba(34,211,238,0.55)] backdrop-blur-md"
-          >
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200/70">
-                  🤖 Analyst bot
-                </div>
-                <h3 className="mt-1 text-lg font-semibold text-white">{agent.agent}</h3>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {agent.round2 && (
-                  <span className={clsx("rounded-full border px-2.5 py-1 text-[11px] font-semibold", getConvictionClasses(agent.round2.conviction))}>
-                    {agent.round2.conviction}
-                  </span>
-                )}
-                <span
-                  className={clsx(
-                    "rounded-full px-2.5 py-1 text-[11px] font-semibold",
-                    (agent.round2?.direction ?? agent.round1?.direction) === "Up"
-                      ? "bg-emerald-50 text-emerald-700"
-                      : "bg-rose-50 text-rose-700",
-                  )}
-                >
-                  {agent.round2?.direction ?? agent.round1?.direction ?? "Pending"}
-                </span>
-              </div>
+      <div className="relative mt-5 rounded-[24px] border border-cyan-300/18 bg-white/7 p-4 backdrop-blur-md">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-semibold text-white">
+              <MessageSquare className="h-4 w-4 text-cyan-300" />
+              Discussion rounds
             </div>
-
-            <div className="mt-4 space-y-3">
-              <div className="rounded-[18px] border border-white/10 bg-slate-950/30 p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-200/65">
-                  First read
-                </div>
-                <p className="mt-2 text-sm leading-6 text-slate-100/85">
-                  {agent.round1?.thesis ?? "Waiting for first-pass verdict…"}
-                </p>
-              </div>
-              <div className="rounded-[18px] border border-white/10 bg-slate-950/35 p-3">
-                <div className="flex items-center justify-between gap-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-200/65">
-                  <span>Final stance</span>
-                  {agent.round2?.revised && <span className="text-amber-300">Changed view</span>}
-                </div>
-                <p className="mt-2 text-sm leading-6 text-slate-100/85">
-                  {agent.round2?.thesis ?? "Waiting for response round…"}
-                </p>
-                {agent.round2?.rebuttals && Object.keys(agent.round2.rebuttals).length > 0 && (
-                  <div className="mt-3 space-y-2">
-                    {Object.entries(agent.round2.rebuttals).map(([label, message]) => (
-                      <div key={label} className="rounded-[16px] border border-cyan-300/15 bg-white/6 px-3 py-2 text-xs leading-5 text-slate-200/80">
-                        <span className="font-semibold text-cyan-100">{label}:</span> {message}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-              {agent.round1?.key_signals && agent.round1.key_signals.length > 0 && (
-                <div className="flex flex-wrap gap-2">
-                  {agent.round1.key_signals.map((signal) => (
-                    <span key={signal} className="rounded-full border border-cyan-300/25 bg-cyan-400/10 px-2.5 py-1 text-[11px] font-semibold text-cyan-100">
-                      {signal}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </div>
+            <p className="mt-1 text-sm text-slate-200/75">
+              Switch between opening takes, rebuttal round, and the final moderator call.
+            </p>
           </div>
-        ))}
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => setSelectedRoundOverride("round1")}
+              className={clsx(
+                "rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.16em] transition",
+                selectedRound === "round1"
+                  ? "border-cyan-300/40 bg-cyan-400/20 text-white"
+                  : "border-cyan-300/18 bg-white/6 text-slate-200/80 hover:bg-white/10",
+              )}
+            >
+              Round 1 · {round1Count}/4
+            </button>
+            <button
+              onClick={() => setSelectedRoundOverride("round2")}
+              className={clsx(
+                "rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.16em] transition",
+                selectedRound === "round2"
+                  ? "border-cyan-300/40 bg-cyan-400/20 text-white"
+                  : "border-cyan-300/18 bg-white/6 text-slate-200/80 hover:bg-white/10",
+              )}
+            >
+              Round 2 · {round2Count}/4
+            </button>
+            <button
+              onClick={() => setSelectedRoundOverride("final")}
+              className={clsx(
+                "rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.16em] transition",
+                selectedRound === "final"
+                  ? "border-cyan-300/40 bg-cyan-400/20 text-white"
+                  : "border-cyan-300/18 bg-white/6 text-slate-200/80 hover:bg-white/10",
+              )}
+            >
+              Final call
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-4 lg:grid-cols-2">
+          {agents.length > 0 ? (
+            agents.map((agent) => renderAgentCard(agent, selectedRound))
+          ) : (
+            <div className="rounded-[18px] border border-cyan-300/15 bg-white/6 px-4 py-3 text-sm text-slate-200/75 lg:col-span-2">
+              Swarm activity will appear here as soon as deep analysis starts.
+            </div>
+          )}
+        </div>
       </div>
 
       {swarm?.status === "streaming" && Object.keys(swarm.agents).length === 0 && (
@@ -1162,12 +1462,12 @@ function SwarmAnalysisPanel({
         </div>
       )}
 
-      {swarm?.moderator && (
+      {swarm?.moderator && selectedRound === "final" && (
         <div className="mt-5 rounded-[24px] border border-fuchsia-300/20 bg-[linear-gradient(145deg,rgba(91,33,182,0.32),rgba(15,23,42,0.96),rgba(8,47,73,0.88))] p-5 text-white shadow-[0_24px_80px_-44px_rgba(168,85,247,0.55)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <div className="text-xs font-semibold uppercase tracking-[0.18em] text-fuchsia-100/70">
-                🤖 Moderator bot verdict
+                Moderator verdict
               </div>
               <div className="mt-2 text-2xl font-semibold tracking-tight">
                 {swarm.moderator.final_direction} · {(swarm.moderator.final_confidence * 100).toFixed(1)}%
@@ -1243,7 +1543,7 @@ function SwarmAnalysisPanel({
         </div>
       </div>
 
-      {swarm?.deliberationId && (
+      {showAskPanel && swarm?.deliberationId && (
         <div className="mt-5 rounded-[24px] border border-cyan-300/18 bg-white/7 p-4 backdrop-blur-md">
           <div className="flex items-center gap-2 text-sm font-semibold text-white">
             <MessageSquare className="h-4 w-4 text-cyan-300" />
@@ -1254,25 +1554,25 @@ function SwarmAnalysisPanel({
           </p>
           <div className="mt-3 grid gap-3 md:grid-cols-[180px_1fr_auto]">
             <select
-              value={interviewAgent}
-              onChange={(event) => setInterviewAgent(event.target.value)}
+              value={interviewAgent ?? ""}
+              onChange={(event) => setInterviewAgent?.(event.target.value)}
               className="rounded-[18px] border border-cyan-300/20 bg-slate-950/35 px-3 py-3 text-sm text-white outline-none"
             >
-              {Object.values(swarm.agents).map((agent) => (
+              {agents.map((agent) => (
                 <option key={agent.agentId} value={agent.agentId}>
                   {agent.agent}
                 </option>
               ))}
             </select>
             <input
-              value={interviewQuestion}
-              onChange={(event) => setInterviewQuestion(event.target.value)}
+              value={interviewQuestion ?? ""}
+              onChange={(event) => setInterviewQuestion?.(event.target.value)}
               placeholder="Why did you challenge the model?"
               className="rounded-[18px] border border-cyan-300/20 bg-slate-950/35 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-400"
             />
             <button
               onClick={onAsk}
-              disabled={!interviewQuestion.trim() || interviewLoading}
+              disabled={!interviewQuestion?.trim() || interviewLoading}
               className="rounded-[18px] border border-cyan-300/20 bg-[linear-gradient(135deg,rgba(45,212,191,0.28),rgba(59,130,246,0.30))] px-4 py-3 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {interviewLoading ? "Asking…" : "Ask"}
@@ -1870,8 +2170,14 @@ export default function Home() {
   const [usageCount, setUsageCount] = useState(0);
   const [usageLimit, setUsageLimit] = useState(3);
   const [usageLoaded, setUsageLoaded] = useState(false);
+  const [archiveHistoryKey, setArchiveHistoryKey] = useState<string | null>(null);
+  const [archivedSwarm, setArchivedSwarm] = useState<SwarmTickerState | null>(null);
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
   const autoBootstrapped = useRef(false);
   const swarmAbortControllers = useRef<Record<string, AbortController>>({});
+  const swarmArchiveLoads = useRef<Record<string, boolean>>({});
+  const totalTickerCount = tickers.length;
 
   function getResultKey(result: Pick<PredictionResult, "request_id" | "ticker">) {
     return `${result.request_id}:${result.ticker}`;
@@ -1956,6 +2262,8 @@ export default function Home() {
   };
 
   useEffect(() => {
+    if (!hydrated) return;
+
     if (session?.user?.email) {
       fetchHistory();
       fetchUsage();
@@ -1963,8 +2271,15 @@ export default function Home() {
       setHistory([]);
       setUsageCount(0);
       setUsageLoaded(true);
+      setTickers((prev) => {
+        const guestTickers = prev.filter((tickerItem) => isDefaultTicker(tickerItem));
+        return guestTickers.length > 0 ? guestTickers : DEFAULT_TICKERS;
+      });
+      setResults((prev) => prev.filter((result) => isDefaultTicker(result.ticker)));
+      setSelectedTicker((current) => (current && isDefaultTicker(current) ? current : null));
+      setSelectedResultKey(null);
     }
-  }, [session]);
+  }, [hydrated, session]);
 
   useEffect(() => {
     const ticker = selectedTicker;
@@ -2000,6 +2315,58 @@ export default function Home() {
     }
   };
 
+  const loadSwarmArchive = async (deliberationId: string): Promise<SwarmTickerState> => {
+    const response = await fetch(`/api/swarm/deliberation/${encodeURIComponent(deliberationId)}`);
+    const payload = await response.json().catch(() => ({ error: "Failed to load archived deep analysis." }));
+    if (!response.ok) {
+      throw new Error(getErrorMessage((payload as { error?: unknown }).error));
+    }
+
+    const replayState = buildSwarmReplayState(payload);
+    if (!replayState) {
+      throw new Error("Archived deep analysis could not be parsed.");
+    }
+    return replayState;
+  };
+
+  const openArchivedSwarm = async (item: HistoryItem) => {
+    if (!item.swarm_deliberation_id) {
+      return;
+    }
+
+    setArchiveHistoryKey(buildHistoryKey(item));
+    setArchiveLoading(true);
+    setArchiveError(null);
+    setArchivedSwarm(null);
+    try {
+      const replayState = await loadSwarmArchive(item.swarm_deliberation_id);
+      setArchivedSwarm(replayState);
+    } catch (err: unknown) {
+      setArchivedSwarm(null);
+      setArchiveError(getErrorMessage(err));
+    } finally {
+      setArchiveLoading(false);
+    }
+  };
+
+  const hydrateActiveSwarmFromArchive = async (result: PredictionResult, deliberationId: string) => {
+    const loadKey = `${result.ticker}:${result.request_id}:${deliberationId}`;
+    if (swarmArchiveLoads.current[loadKey]) {
+      return;
+    }
+
+    swarmArchiveLoads.current[loadKey] = true;
+    try {
+      const replayState = await loadSwarmArchive(deliberationId);
+      setSwarmByTicker((current) => ({
+        ...current,
+        [result.ticker]: replayState,
+      }));
+    } catch {
+      delete swarmArchiveLoads.current[loadKey];
+    }
+  };
+
   const appendSwarmLog = (
     tickerSymbol: string,
     requestId: string,
@@ -2009,6 +2376,7 @@ export default function Home() {
       const next: SwarmTickerState = current ?? {
         requestId,
         status: "streaming",
+        source: "live",
         agents: {},
         interviewTurns: [],
         logs: [],
@@ -2092,11 +2460,13 @@ export default function Home() {
       const next: SwarmTickerState = current ?? {
         requestId,
         status: "streaming",
+        source: "live",
         agents: {},
         interviewTurns: [],
         logs: [],
       };
       next.requestId = requestId;
+      next.source = "live";
 
       if (eventName === "round1_verdict" || eventName === "round2_verdict") {
         const agentId = String(payload.agent_id ?? "");
@@ -2134,6 +2504,11 @@ export default function Home() {
       return { ...next };
     });
     appendSwarmLog(tickerSymbol, requestId, buildSwarmLogEntry(eventName, payload));
+    if (eventName === "done" && session?.user?.email) {
+      setTimeout(() => {
+        void fetchHistory();
+      }, 1200);
+    }
   };
 
   const parseSseChunk = (
@@ -2163,6 +2538,11 @@ export default function Home() {
   };
 
   const startSwarmAnalysis = async (result: PredictionResult) => {
+    if (!ensureTickerRunAllowed("starting swarm analysis")) {
+      return;
+    }
+
+    setError(null);
     const existing = swarmAbortControllers.current[result.ticker];
     existing?.abort();
     const controller = new AbortController();
@@ -2172,6 +2552,7 @@ export default function Home() {
     upsertSwarmState(result.ticker, (current) => ({
       requestId: result.request_id,
       status: "streaming",
+      source: "live",
       agents: {},
       interviewTurns: current?.requestId === result.request_id ? current.interviewTurns : [],
       logs:
@@ -2202,6 +2583,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ticker: result.ticker,
+          tickers,
           request_id: result.request_id,
           ml_prediction: {
             direction: result.prediction,
@@ -2348,6 +2730,10 @@ export default function Home() {
     void startSwarmAnalysis(result);
   });
 
+  const runHydrateSwarmArchiveEffect = useEffectEvent((result: PredictionResult, deliberationId: string) => {
+    void hydrateActiveSwarmFromArchive(result, deliberationId);
+  });
+
   useEffect(() => {
     if (results.length === 0) {
       setSelectedTicker((current) => current ?? tickers[0] ?? null);
@@ -2389,6 +2775,8 @@ export default function Home() {
     results[0] ??
     null;
   const activeSwarm = activeResult ? swarmByTicker[activeResult.ticker] ?? null : null;
+  const selectedArchiveItem =
+    archiveHistoryKey ? history.find((item) => buildHistoryKey(item) === archiveHistoryKey) ?? null : null;
 
   useEffect(() => {
     if (analysisMode !== "deep" || !activeResult) {
@@ -2398,8 +2786,15 @@ export default function Home() {
     if (swarm?.requestId === activeResult.request_id && (swarm.status === "streaming" || swarm.status === "done")) {
       return;
     }
+    const matchingHistory = history.find(
+      (item) => item.request_id === activeResult.request_id && item.ticker === activeResult.ticker,
+    );
+    if (matchingHistory?.swarm_deliberation_id) {
+      runHydrateSwarmArchiveEffect(activeResult, matchingHistory.swarm_deliberation_id);
+      return;
+    }
     runSwarmEffect(activeResult);
-  }, [analysisMode, activeResult, swarmByTicker]);
+  }, [analysisMode, activeResult, history, swarmByTicker]);
 
   useEffect(() => {
     const availableAgents = Object.keys(activeSwarm?.agents ?? {});
@@ -2539,6 +2934,17 @@ export default function Home() {
       return;
     }
 
+    if (!session) {
+      setError("Sign in to manage tickers. Guests can run the default market universe only.");
+      return;
+    }
+
+    if (totalTickerCount >= FREE_TICKER_LIMIT) {
+      setError(`Free accounts can track up to ${FREE_TICKER_LIMIT} tickers total.`);
+      return;
+    }
+
+    setError(null);
     setTickers((prev) => [...prev, normalized]);
     setSelectedTicker((current) => current ?? normalized);
     setTicker("");
@@ -2550,8 +2956,26 @@ export default function Home() {
     setSelectedTicker((current) => (current === target ? null : current));
   }
 
+  function ensureTickerRunAllowed(actionLabel: string) {
+    if (tickers.length > FREE_TICKER_LIMIT) {
+      setError(`Free accounts can run up to ${FREE_TICKER_LIMIT} tickers at a time. Remove extra tickers before ${actionLabel}.`);
+      return false;
+    }
+
+    if (!session && tickers.some((tickerItem) => !isDefaultTicker(tickerItem))) {
+      setError("Sign in to run custom tickers. Guests can use the default market universe only.");
+      return false;
+    }
+
+    return true;
+  }
+
   async function predict() {
     if (tickers.length === 0) {
+      return;
+    }
+
+    if (!ensureTickerRunAllowed("running prediction")) {
       return;
     }
 
@@ -2671,8 +3095,8 @@ export default function Home() {
                     Institutional-grade signals from live market, news, and macro data.
                   </h1>
                   <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-600 sm:text-base">
-                    Your default market universe loads automatically. Edit the ticker list to
-                    run focused scans, then review the signal board and model drivers.
+                    Your default market universe loads automatically. Sign in to manage up to 3
+                    tickers, then review the signal board and model drivers.
                   </p>
                 </div>
                 <div className="hidden rounded-[28px] border border-slate-200/80 bg-white/90 p-4 lg:block">
@@ -2749,7 +3173,7 @@ export default function Home() {
                   {loading ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      Refreshing live frame
+                      Running prediction
                     </>
                   ) : usageLoaded && usageCount >= usageLimit ? (
                     <>
@@ -2759,10 +3183,16 @@ export default function Home() {
                   ) : (
                     <>
                       <Sparkles className="h-4 w-4" />
-                      {results.length > 0 ? "Refresh live signal" : "Run live prediction"}
+                      Run prediction
                     </>
                   )}
                 </button>
+              </div>
+
+              <div className="mt-3 text-xs text-slate-500">
+                {!session
+                  ? "Sign in to manage tickers. Guests can run the default market universe."
+                  : `Free plan: ${totalTickerCount} / ${FREE_TICKER_LIMIT} tickers selected.`}
               </div>
 
               <div className="mt-4 inline-flex rounded-full border border-slate-200 bg-white/90 p-1">
@@ -2797,8 +3227,8 @@ export default function Home() {
                       <LogIn className="h-5 w-5 text-violet-600" />
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-slate-900">Sign in to save your workspace</p>
-                      <p className="text-xs text-slate-500">Predictions still run without login. Signing in keeps history, usage tracking, and feedback tied to your account.</p>
+                      <p className="text-sm font-semibold text-slate-900">Sign in to manage your ticker list</p>
+                      <p className="text-xs text-slate-500">Guests can run the default market universe. Sign in to manage up to 3 tickers, save history, and keep usage tied to your account.</p>
                     </div>
                     <button
                       onClick={() => signIn("google")}
@@ -3105,6 +3535,7 @@ export default function Home() {
                       <tr>
                         <th className="px-6 py-4">Ticker</th>
                         <th className="px-6 py-4">Prediction</th>
+                        <th className="px-6 py-4">Deep Analysis</th>
                         <th className="px-6 py-4">Prob</th>
                         <th className="px-6 py-4">Price</th>
                         <th className="px-6 py-4">News</th>
@@ -3115,7 +3546,13 @@ export default function Home() {
                     <tbody className="divide-y divide-slate-100/60">
                       {history.length > 0 ? (
                         history.map((item, idx) => (
-                          <tr key={`${item.request_id}-${idx}`} className="group hover:bg-slate-50/40">
+                          <tr
+                            key={`${item.request_id}-${idx}`}
+                            className={clsx(
+                              "group hover:bg-slate-50/40",
+                              archiveHistoryKey === buildHistoryKey(item) && "bg-cyan-50/50",
+                            )}
+                          >
                             <td className="px-6 py-4 font-semibold text-slate-900">
                               {item.ticker}
                             </td>
@@ -3126,6 +3563,26 @@ export default function Home() {
                               )}>
                                 {item.prediction}
                               </span>
+                            </td>
+                            <td className="px-6 py-4">
+                              {item.swarm_deliberation_id ? (
+                                <div className="flex flex-col items-start gap-2">
+                                  <button
+                                    onClick={() => void openArchivedSwarm(item)}
+                                    className="rounded-full bg-[linear-gradient(135deg,#0f766e,#0b3b5a)] px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition hover:brightness-105"
+                                  >
+                                    {archiveHistoryKey === buildHistoryKey(item) ? "Replay loaded" : "Open replay"}
+                                  </button>
+                                  <span className="text-xs text-slate-500">
+                                    {item.swarm_final_direction ?? "Ready"}
+                                    {item.swarm_final_confidence !== null && item.swarm_final_confidence !== undefined
+                                      ? ` · ${(item.swarm_final_confidence * 100).toFixed(1)}%`
+                                      : ""}
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="text-xs text-slate-400">Not saved</span>
+                              )}
                             </td>
                             <td className="px-6 py-4 tabular-nums text-slate-600">
                               {(item.prob_up * 100).toFixed(1)}%
@@ -3153,7 +3610,7 @@ export default function Home() {
                         ))
                       ) : (
                         <tr>
-                          <td colSpan={7} className="px-6 py-12 text-center text-slate-400">
+                          <td colSpan={8} className="px-6 py-12 text-center text-slate-400">
                             {loadingHistory ? "Loading your history..." : "History will appear after your first prediction."}
                           </td>
                         </tr>
@@ -3162,6 +3619,32 @@ export default function Home() {
                   </table>
                 </div>
               </div>
+
+              {(archiveLoading || archiveError || archivedSwarm || selectedArchiveItem) && (
+                <div className="mt-6">
+                  {archiveLoading && (
+                    <div className="mb-4 flex items-center gap-2 rounded-[20px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Loading archived deep analysis…
+                    </div>
+                  )}
+                  {archiveError && (
+                    <div className="mb-4 flex items-center gap-2 rounded-[20px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                      <AlertCircle className="h-4 w-4" />
+                      {archiveError}
+                    </div>
+                  )}
+                  {archivedSwarm && selectedArchiveItem && (
+                    <SwarmAnalysisPanel
+                      ticker={selectedArchiveItem.ticker}
+                      swarm={archivedSwarm}
+                      variant="archive"
+                      archivedAt={selectedArchiveItem.swarm_created_at ?? selectedArchiveItem.predicted_at}
+                      nowMs={nowMs}
+                    />
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -3277,17 +3760,18 @@ export default function Home() {
                     <TopDriverCards driverFeatures={topDriverFeatures} />
 
                     {analysisMode === "deep" && (
-                      <SwarmAnalysisPanel
-                        ticker={activeResult.ticker}
-                        swarm={activeSwarm}
-                        onRetry={() => void startSwarmAnalysis(activeResult)}
-                        onAsk={() => void askSwarmAgent()}
+                    <SwarmAnalysisPanel
+                      ticker={activeResult.ticker}
+                      swarm={activeSwarm}
+                      onRetry={() => void startSwarmAnalysis(activeResult)}
+                      onAsk={() => void askSwarmAgent()}
                         interviewAgent={interviewAgent}
-                        setInterviewAgent={setInterviewAgent}
-                        interviewQuestion={interviewQuestion}
-                        setInterviewQuestion={setInterviewQuestion}
-                        interviewLoading={interviewLoading}
-                      />
+                      setInterviewAgent={setInterviewAgent}
+                      interviewQuestion={interviewQuestion}
+                      setInterviewQuestion={setInterviewQuestion}
+                      interviewLoading={interviewLoading}
+                      nowMs={nowMs}
+                    />
                     )}
 
                     <div className="rounded-[32px] border border-white/70 bg-white/80 p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)] backdrop-blur">
