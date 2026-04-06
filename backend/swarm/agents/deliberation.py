@@ -18,6 +18,7 @@ ROUND1_SCHEMA = {
         "confidence_delta": {"type": "NUMBER"},
         "conviction": {"type": "STRING", "enum": ["low", "medium", "high"]},
         "thesis": {"type": "STRING"},
+        "public_notes": {"type": "ARRAY", "items": {"type": "STRING"}},
         "key_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
         "agrees_with_model": {"type": "BOOLEAN"},
     },
@@ -26,6 +27,7 @@ ROUND1_SCHEMA = {
         "confidence_delta",
         "conviction",
         "thesis",
+        "public_notes",
         "key_signals",
         "agrees_with_model",
     ],
@@ -39,6 +41,7 @@ ROUND2_SCHEMA = {
         "confidence_delta": {"type": "NUMBER"},
         "conviction": {"type": "STRING", "enum": ["low", "medium", "high"]},
         "thesis": {"type": "STRING"},
+        "public_notes": {"type": "ARRAY", "items": {"type": "STRING"}},
         "rebuttals": {"type": "OBJECT"},
         "agrees_with_model": {"type": "BOOLEAN"},
     },
@@ -48,6 +51,7 @@ ROUND2_SCHEMA = {
         "confidence_delta",
         "conviction",
         "thesis",
+        "public_notes",
         "rebuttals",
         "agrees_with_model",
     ],
@@ -252,6 +256,11 @@ def _heuristic_round1(
         "confidence_delta": round(delta, 4),
         "conviction": conviction,
         "thesis": " ".join(thesis_parts)[:320],
+        "public_notes": [
+            f"Checking {persona.display_name.lower()}'s core lens against the live frame.",
+            f"Headline sentiment={round(sentiment, 3)}, SPY move={round(spy_change, 3)}, VIX={round(vix_level, 2)}.",
+            f"My provisional lean is {direction.lower()} with {conviction} conviction.",
+        ][:3],
         "key_signals": key_signals[:3],
         "agrees_with_model": agrees_with_model,
     }
@@ -297,6 +306,11 @@ def _heuristic_round2(
         "confidence_delta": round(delta, 4),
         "conviction": conviction,
         "thesis": thesis[:320],
+        "public_notes": [
+            "Reading the other agents before I lock the second-round stance.",
+            f"I {'changed' if revised else 'kept'} my view after comparing signal weighting across the room.",
+            f"My closing lean is {direction.lower()} with {conviction} conviction.",
+        ][:3],
         "rebuttals": rebuttals,
         "agrees_with_model": direction == ml_prediction.direction,
     }
@@ -337,6 +351,8 @@ class DeliberationOrchestrator:
             "When reasoning, explicitly weigh trend/momentum, volatility/risk, macro regime,"
             " and the tone/dispersion of news. Confidence_delta should adjust the base model"
             " confidence, not replace it.\n"
+            "Also provide 2-3 short public_notes for the user interface. These are brief, user-visible"
+            " progress notes, not private chain-of-thought.\n"
             "Return structured JSON only."
         )
 
@@ -368,6 +384,8 @@ class DeliberationOrchestrator:
             f"Other agents: {peer_summary}\n"
             f"Full key feature frame: {_top_feature_context(request.feature_snapshot, limit=28)}\n"
             f"Recent sentiment-scored headlines: {_news_context(request.news_items)}\n"
+            "Also provide 2-3 short public_notes for the user interface. These are brief, user-visible"
+            " progress notes, not private chain-of-thought.\n"
             "Return structured JSON only."
         )
 
