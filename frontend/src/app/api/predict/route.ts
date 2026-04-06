@@ -7,6 +7,8 @@ export const runtime = "nodejs";
 
 const LIVE_SNAPSHOT_FRESH_TTL_SECONDS = parseInt(process.env.LIVE_SNAPSHOT_FRESH_TTL_SECONDS || "3600", 10);
 const FREE_DAILY_LIMIT = 3;
+const FREE_TICKER_LIMIT = 3;
+const DEFAULT_TICKERS = new Set(["SPY", "QQQ", "AAPL"]);
 
 interface FeatureSnapshotPayload {
   company_name?: string | null;
@@ -233,14 +235,38 @@ export async function POST(req: NextRequest) {
   }
 
   // Support both { instances: [{ ticker: "AAPL" }] } and { tickers: ["AAPL"] } formats
-  const requestedTickers: string[] = body.instances
-    ? body.instances
-        .map((inst) => inst.ticker?.trim().toUpperCase())
-        .filter((t): t is string => Boolean(t))
+  const requestedTickersSource = body.instances
+    ? body.instances.map((inst) => inst.ticker)
     : body.tickers ?? [];
+
+  const requestedTickers: string[] = requestedTickersSource
+    .map((ticker) => ticker?.trim().toUpperCase())
+    .filter((ticker): ticker is string => Boolean(ticker));
 
   if (requestedTickers.length === 0) {
     return NextResponse.json({ predictions: [] });
+  }
+
+  if (requestedTickers.length > FREE_TICKER_LIMIT) {
+    return NextResponse.json(
+      {
+        error: `Free accounts can run up to ${FREE_TICKER_LIMIT} tickers at a time.`,
+        ticker_limit: FREE_TICKER_LIMIT,
+      },
+      { status: 403 },
+    );
+  }
+
+  const requestedCustomTickers = [...new Set(requestedTickers.filter((ticker) => !DEFAULT_TICKERS.has(ticker)))];
+
+  if (!userEmail && requestedCustomTickers.length > 0) {
+    return NextResponse.json(
+      {
+        error: "Sign in to run custom tickers. Guests can use the default market universe only.",
+        sign_in_required: true,
+      },
+      { status: 401 },
+    );
   }
 
   // ── Rate limit: apply only to signed-in users with tracked usage ──

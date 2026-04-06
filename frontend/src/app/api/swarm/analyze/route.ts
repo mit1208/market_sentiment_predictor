@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 export const runtime = "nodejs";
 
 const DEFAULT_SWARM_API_URL = "https://swarm-service-749244369851.us-central1.run.app";
+const FREE_TICKER_LIMIT = 3;
 
 function getSwarmUrl(path: string): string {
   const baseUrl = process.env.SWARM_API_URL?.trim() || DEFAULT_SWARM_API_URL;
@@ -28,13 +29,34 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
   }
 
+  let upstreamBody: unknown = body;
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const payload = { ...(body as Record<string, unknown>) };
+    const submittedTickers = Array.isArray(payload.tickers)
+      ? payload.tickers.filter((ticker): ticker is string => typeof ticker === "string" && ticker.trim().length > 0)
+      : [];
+
+    if (submittedTickers.length > FREE_TICKER_LIMIT) {
+      return NextResponse.json(
+        {
+          error: `Deep Analysis is limited to ${FREE_TICKER_LIMIT} tickers at a time.`,
+          ticker_limit: FREE_TICKER_LIMIT,
+        },
+        { status: 403 },
+      );
+    }
+
+    delete payload.tickers;
+    upstreamBody = payload;
+  }
+
   const upstream = await fetch(swarmUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "text/event-stream",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(upstreamBody),
     cache: "no-store",
   });
 
