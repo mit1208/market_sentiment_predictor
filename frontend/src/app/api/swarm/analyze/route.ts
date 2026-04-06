@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
-const DEFAULT_SWARM_API_URL = "https://swarm-service-749244369851.us-central1.run.app";
+const DEFAULT_SWARM_API_URL = "https://swarm-service-xxm6sesglq-uc.a.run.app";
 const FREE_TICKER_LIMIT = 3;
 
 function getSwarmUrl(path: string): string {
@@ -68,12 +70,37 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  return new Response(upstream.body, {
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const reader = upstream.body.getReader();
+
+  void (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value) {
+          await writer.write(value);
+        }
+      }
+    } catch (error) {
+      console.error("Swarm SSE proxy failed", error);
+    } finally {
+      await writer.close();
+      reader.releaseLock();
+    }
+  })();
+
+  return new Response(readable, {
     status: upstream.status,
     headers: {
-      "Content-Type": "text/event-stream",
+      "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      "Content-Encoding": "none",
+      "X-Accel-Buffering": "no",
     },
   });
 }

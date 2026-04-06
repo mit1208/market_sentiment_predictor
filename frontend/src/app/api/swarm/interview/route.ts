@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-const DEFAULT_SWARM_API_URL = "https://swarm-service-749244369851.us-central1.run.app";
+const DEFAULT_SWARM_API_URL = "https://swarm-service-xxm6sesglq-uc.a.run.app";
 
 function getSwarmUrl(path: string): string {
   const baseUrl = process.env.SWARM_API_URL?.trim() || DEFAULT_SWARM_API_URL;
