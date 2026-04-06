@@ -13,6 +13,7 @@ export async function GET() {
     return NextResponse.json({
       signed_in: false,
       prediction_count: 0,
+      used_tickers: [],
       daily_limit: FREE_DAILY_LIMIT,
       remaining: FREE_DAILY_LIMIT,
       limit_reached: false,
@@ -26,6 +27,7 @@ export async function GET() {
     return NextResponse.json({
       signed_in: true,
       prediction_count: usage.prediction_count,
+      used_tickers: usage.used_tickers,
       daily_limit: FREE_DAILY_LIMIT,
       remaining,
       limit_reached: remaining <= 0,
@@ -36,6 +38,7 @@ export async function GET() {
     return NextResponse.json({
       signed_in: true,
       prediction_count: 0,
+      used_tickers: [],
       daily_limit: FREE_DAILY_LIMIT,
       remaining: FREE_DAILY_LIMIT,
       limit_reached: false,

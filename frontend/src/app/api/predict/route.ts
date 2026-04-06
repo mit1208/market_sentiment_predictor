@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
-import { getFreshSnapshots, logUserPrediction, getDailyUsage, incrementDailyUsage } from "@/lib/bigquery";
+import { getFreshSnapshots, logUserPrediction, getDailyUsage } from "@/lib/bigquery";
 
 export const runtime = "nodejs";
 
@@ -273,14 +273,24 @@ export async function POST(req: NextRequest) {
   if (userEmail) {
     try {
       const usage = await getDailyUsage(userEmail);
-      if (usage.prediction_count >= FREE_DAILY_LIMIT) {
+      const usedTickers = new Set(usage.used_tickers);
+      const projectedUniqueTickerCount = new Set([
+        ...usage.used_tickers,
+        ...requestedTickers,
+      ]).size;
+
+      if (projectedUniqueTickerCount > FREE_DAILY_LIMIT) {
+        const remaining = Math.max(0, FREE_DAILY_LIMIT - usage.prediction_count);
         return NextResponse.json(
           {
-            error: `You've used all ${FREE_DAILY_LIMIT} free predictions today. Upgrade to Pro for unlimited access.`,
-            limit_reached: true,
+            error: remaining > 0
+              ? `Free accounts can refresh up to ${FREE_DAILY_LIMIT} unique tickers per day. Remove new tickers or wait until tomorrow.`
+              : `You've used all ${FREE_DAILY_LIMIT} free tickers today. Upgrade to Pro for unlimited access.`,
+            limit_reached: usage.prediction_count >= FREE_DAILY_LIMIT,
             prediction_count: usage.prediction_count,
+            used_tickers: [...usedTickers],
             daily_limit: FREE_DAILY_LIMIT,
-            remaining: 0,
+            remaining,
           },
           { status: 429 },
         );
@@ -420,13 +430,6 @@ export async function POST(req: NextRequest) {
       );
     } catch (error) {
       console.error("Failed to log predictions to BigQuery:", error);
-    }
-
-    // 4. Increment daily usage counter
-    try {
-      await incrementDailyUsage(userEmail);
-    } catch (error) {
-      console.error("Failed to increment daily usage:", error);
     }
   }
 
