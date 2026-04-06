@@ -98,3 +98,49 @@ export async function getUserHistory(email: string) {
   const [rows] = await bigquery.query(options);
   return rows;
 }
+
+export async function getDailyUsage(email: string): Promise<{ prediction_count: number }> {
+  const datasetId = process.env.BQ_DATASET || "market_sentiment_predictor";
+  const query = `
+    SELECT COALESCE(prediction_count, 0) AS prediction_count
+    FROM \`${process.env.GCP_PROJECT_ID}.${datasetId}.user_daily_usage\`
+    WHERE user_email = @user_email
+      AND usage_date = CURRENT_DATE()
+    LIMIT 1
+  `;
+
+  const [rows] = await bigquery.query({
+    query,
+    params: { user_email: email },
+  });
+
+  if (rows.length === 0) {
+    return { prediction_count: 0 };
+  }
+
+  return { prediction_count: Number(rows[0].prediction_count) || 0 };
+}
+
+export async function incrementDailyUsage(email: string, count: number = 1): Promise<number> {
+  const datasetId = process.env.BQ_DATASET || "market_sentiment_predictor";
+  const query = `
+    MERGE \`${process.env.GCP_PROJECT_ID}.${datasetId}.user_daily_usage\` AS target
+    USING (SELECT @user_email AS user_email, CURRENT_DATE() AS usage_date) AS source
+      ON target.user_email = source.user_email AND target.usage_date = source.usage_date
+    WHEN MATCHED THEN
+      UPDATE SET
+        prediction_count = target.prediction_count + @count,
+        last_predicted_at = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN
+      INSERT (user_email, usage_date, prediction_count, last_predicted_at)
+      VALUES (source.user_email, source.usage_date, @count, CURRENT_TIMESTAMP());
+  `;
+
+  await bigquery.query({
+    query,
+    params: { user_email: email, count },
+  });
+
+  const usage = await getDailyUsage(email);
+  return usage.prediction_count;
+}

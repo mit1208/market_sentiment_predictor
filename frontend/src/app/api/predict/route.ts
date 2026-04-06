@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
-import { getFreshSnapshots, logUserPrediction } from "@/lib/bigquery";
+import { getFreshSnapshots, logUserPrediction, getDailyUsage, incrementDailyUsage } from "@/lib/bigquery";
 
 export const runtime = "nodejs";
 
 const LIVE_SNAPSHOT_FRESH_TTL_SECONDS = parseInt(process.env.LIVE_SNAPSHOT_FRESH_TTL_SECONDS || "3600", 10);
+const FREE_DAILY_LIMIT = 3;
 
 interface FeatureSnapshotPayload {
   company_name?: string | null;
@@ -43,6 +44,19 @@ interface YahooQuoteResponse {
   quoteResponse?: {
     result?: YahooQuoteResult[];
   };
+}
+
+function orderPredictionsByRequestedTickers(
+  predictions: PredictionPayload[],
+  requestedTickers: string[],
+): PredictionPayload[] {
+  const rank = new Map(requestedTickers.map((ticker, index) => [ticker, index] as const));
+
+  return [...predictions].sort((left, right) => {
+    const leftRank = rank.get(left.ticker) ?? Number.MAX_SAFE_INTEGER;
+    const rightRank = rank.get(right.ticker) ?? Number.MAX_SAFE_INTEGER;
+    return leftRank - rightRank || left.ticker.localeCompare(right.ticker);
+  });
 }
 
 function getPredictUrl(): string {
@@ -200,6 +214,17 @@ async function enrichPredictionPayload(payload: PredictResponsePayload): Promise
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
   const predictUrl = getPredictUrl();
+
+  // ── Auth gate: require sign-in ──
+  if (!session?.user?.email) {
+    return NextResponse.json(
+      {
+        error: "Sign in to run predictions. Free users get 3 predictions per day.",
+        require_auth: true,
+      },
+      { status: 401 },
+    );
+  }
   
   if (!predictUrl) {
     return NextResponse.json(
@@ -227,6 +252,28 @@ export async function POST(req: NextRequest) {
   if (requestedTickers.length === 0) {
     return NextResponse.json({ predictions: [] });
   }
+
+  // ── Rate limit: free tier = 3 predictions/day ──
+  const userEmail = session.user.email;
+  try {
+    const usage = await getDailyUsage(userEmail);
+    if (usage.prediction_count >= FREE_DAILY_LIMIT) {
+      return NextResponse.json(
+        {
+          error: `You've used all ${FREE_DAILY_LIMIT} free predictions today. Upgrade to Pro for unlimited access.`,
+          limit_reached: true,
+          prediction_count: usage.prediction_count,
+          daily_limit: FREE_DAILY_LIMIT,
+          remaining: 0,
+        },
+        { status: 429 },
+      );
+    }
+  } catch (err) {
+    // Fail open — don't block predictions if usage check fails
+    console.error("Usage check failed, proceeding:", err);
+  }
+
 
   // 1. Check for fresh snapshots in BigQuery
   type BQSnapshot = Record<string, unknown>;
@@ -340,23 +387,29 @@ export async function POST(req: NextRequest) {
   }
 
   // 3. Log results to BigQuery for authenticated users
-  const userEmail = session?.user?.email ?? null;
-  if (userEmail) {
-    try {
-      const rowsToLog = finalPredictions.filter(
-        (p) => typeof p.request_id === "string" && p.request_id && typeof p.ticker === "string" && p.ticker,
-      );
-      const skipped = finalPredictions.length - rowsToLog.length;
-      if (skipped > 0) {
-        console.warn(`Skipping ${skipped} prediction logs due to missing request_id or ticker.`);
-      }
-      await Promise.all(
-        rowsToLog.map((p) => logUserPrediction(userEmail, p.request_id, p.ticker))
-      );
-    } catch (error) {
-      console.error("Failed to log predictions to BigQuery:", error);
+  const orderedPredictions = orderPredictionsByRequestedTickers(finalPredictions, requestedTickers);
+
+  try {
+    const rowsToLog = orderedPredictions.filter(
+      (p) => typeof p.request_id === "string" && p.request_id && typeof p.ticker === "string" && p.ticker,
+    );
+    const skipped = orderedPredictions.length - rowsToLog.length;
+    if (skipped > 0) {
+      console.warn(`Skipping ${skipped} prediction logs due to missing request_id or ticker.`);
     }
+    await Promise.all(
+      rowsToLog.map((p) => logUserPrediction(userEmail, p.request_id, p.ticker))
+    );
+  } catch (error) {
+    console.error("Failed to log predictions to BigQuery:", error);
   }
 
-  return NextResponse.json({ predictions: finalPredictions });
+  // 4. Increment daily usage counter
+  try {
+    await incrementDailyUsage(userEmail);
+  } catch (error) {
+    console.error("Failed to increment daily usage:", error);
+  }
+
+  return NextResponse.json({ predictions: orderedPredictions });
 }

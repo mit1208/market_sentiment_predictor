@@ -11,6 +11,7 @@ import {
   ArrowUpRight,
   BarChart3,
   Brain,
+  CheckCircle,
   Clock3,
   Database,
   Filter,
@@ -23,8 +24,12 @@ import {
   Newspaper,
   Plus,
   Search,
+  Send,
   Shield,
   Sparkles,
+  Star,
+  ThumbsDown,
+  ThumbsUp,
   TrendingDown,
   TrendingUp,
   User,
@@ -1855,6 +1860,16 @@ export default function Home() {
   const [chartTicker, setChartTicker] = useState<string | null>(null);
   const [chartLoading, setChartLoading] = useState(false);
   const [hydrated, setHydrated] = useState(false);
+  const [feedbackDirection, setFeedbackDirection] = useState<"Up" | "Down" | null>(null);
+  const [feedbackSentiment, setFeedbackSentiment] = useState<"bullish" | "bearish" | "neutral" | null>(null);
+  const [feedbackConfidence, setFeedbackConfidence] = useState<number>(3);
+  const [feedbackComment, setFeedbackComment] = useState("");
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [feedbackSuccess, setFeedbackSuccess] = useState(false);
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [usageCount, setUsageCount] = useState(0);
+  const [usageLimit, setUsageLimit] = useState(3);
+  const [usageLoaded, setUsageLoaded] = useState(false);
   const autoBootstrapped = useRef(false);
   const swarmAbortControllers = useRef<Record<string, AbortController>>({});
 
@@ -1866,11 +1881,31 @@ export default function Home() {
     if (typeof window === "undefined") return;
     try {
       const storedResults = window.localStorage.getItem("predictionResults");
+      const storedTickers = window.localStorage.getItem("predictionTickers");
       const storedTicker = window.localStorage.getItem("selectedTicker");
+
+      let restoredResults: PredictionResult[] = [];
       if (storedResults) {
         const parsed = JSON.parse(storedResults);
-        setResults(sanitizePredictionResults(parsed));
+        restoredResults = sanitizePredictionResults(parsed);
+        setResults(restoredResults);
       }
+
+      if (storedTickers) {
+        const parsed = JSON.parse(storedTickers);
+        if (Array.isArray(parsed)) {
+          const restoredTickers = parsed
+            .map((value) => (typeof value === "string" ? value.trim().toUpperCase() : ""))
+            .filter((value): value is string => Boolean(value));
+
+          if (restoredTickers.length > 0) {
+            setTickers(restoredTickers);
+          }
+        }
+      } else if (restoredResults.length > 0) {
+        setTickers(restoredResults.map((result) => result.ticker));
+      }
+
       if (storedTicker) {
         setSelectedTicker(storedTicker);
       }
@@ -1888,6 +1923,11 @@ export default function Home() {
 
   useEffect(() => {
     if (!hydrated || typeof window === "undefined") return;
+    window.localStorage.setItem("predictionTickers", JSON.stringify(tickers));
+  }, [tickers, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated || typeof window === "undefined") return;
     if (selectedTicker) {
       window.localStorage.setItem("selectedTicker", selectedTicker);
     } else {
@@ -1900,11 +1940,29 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, []);
 
+  const fetchUsage = async () => {
+    try {
+      const res = await fetch("/api/usage");
+      if (res.ok) {
+        const data = await res.json();
+        setUsageCount(data.prediction_count ?? 0);
+        setUsageLimit(data.daily_limit ?? 3);
+      }
+    } catch {
+      // silently fail
+    } finally {
+      setUsageLoaded(true);
+    }
+  };
+
   useEffect(() => {
     if (session?.user?.email) {
       fetchHistory();
+      fetchUsage();
     } else {
       setHistory([]);
+      setUsageCount(0);
+      setUsageLoaded(true);
     }
   }, [session]);
 
@@ -2497,6 +2555,11 @@ export default function Home() {
       return;
     }
 
+    if (!session?.user?.email) {
+      signIn("google");
+      return;
+    }
+
     setLoading(true);
     setError(null);
     Object.values(swarmAbortControllers.current).forEach((controller) => controller.abort());
@@ -2514,7 +2577,14 @@ export default function Home() {
       const data = (await res.json()) as {
         predictions?: PredictionResult[];
         error?: unknown;
+        require_auth?: boolean;
+        limit_reached?: boolean;
       };
+
+      if (data.require_auth) {
+        signIn("google");
+        return;
+      }
 
       if (!res.ok) {
         throw new Error(getErrorMessage(data.error) || `HTTP ${res.status}`);
@@ -2529,6 +2599,7 @@ export default function Home() {
       }
       if (session?.user?.email) {
         setTimeout(() => fetchHistory(), 1500);
+        fetchUsage();
       }
       setSearch("");
       setSourceFilter("all");
@@ -2683,13 +2754,28 @@ export default function Home() {
 
                 <button
                   onClick={predict}
-                  disabled={tickers.length === 0 || loading}
-                  className="inline-flex items-center justify-center gap-2 rounded-[28px] bg-[linear-gradient(135deg,#0f766e,#0b3b5a)] px-5 py-4 text-sm font-semibold text-white transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={tickers.length === 0 || loading || !!(session && usageLoaded && usageCount >= usageLimit)}
+                  className={clsx(
+                    "inline-flex items-center justify-center gap-2 rounded-[28px] px-5 py-4 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40",
+                    !session
+                      ? "bg-[linear-gradient(135deg,#7c3aed,#4f46e5)] text-white hover:brightness-110"
+                      : "bg-[linear-gradient(135deg,#0f766e,#0b3b5a)] text-white hover:brightness-105",
+                  )}
                 >
                   {loading ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
                       Refreshing live frame
+                    </>
+                  ) : !session ? (
+                    <>
+                      <LogIn className="h-4 w-4" />
+                      Sign in to predict
+                    </>
+                  ) : usageLoaded && usageCount >= usageLimit ? (
+                    <>
+                      <AlertCircle className="h-4 w-4" />
+                      Daily limit reached
                     </>
                   ) : (
                     <>
@@ -2725,9 +2811,58 @@ export default function Home() {
                 </button>
               </div>
 
-              {!session && (
-                <div className="mt-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-                  Predictions don’t require login. Sign in only to save history.
+              {!session ? (
+                <div className="mt-4 rounded-[22px] border border-violet-200/70 bg-[linear-gradient(135deg,rgba(139,92,246,0.08),rgba(79,70,229,0.06))] px-5 py-4">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-violet-100">
+                      <LogIn className="h-5 w-5 text-violet-600" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">Sign in to get started</p>
+                      <p className="text-xs text-slate-500">Free users get {usageLimit} predictions per day. Upgrade for unlimited access.</p>
+                    </div>
+                    <button
+                      onClick={() => signIn("google")}
+                      className="ml-auto rounded-full bg-[linear-gradient(135deg,#7c3aed,#4f46e5)] px-5 py-2.5 text-xs font-semibold text-white transition hover:brightness-110"
+                    >
+                      Sign in with Google
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-4 rounded-[22px] border border-slate-200/70 bg-white/80 px-5 py-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                      <Gauge className="h-3.5 w-3.5" />
+                      Daily usage
+                    </div>
+                    <div className="text-xs font-semibold text-slate-600">
+                      {usageCount} / {usageLimit} predictions today
+                    </div>
+                  </div>
+                  <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-100">
+                    <motion.div
+                      className={clsx(
+                        "h-full rounded-full transition-all duration-500",
+                        usageCount >= usageLimit
+                          ? "bg-rose-500"
+                          : usageCount >= usageLimit - 1
+                            ? "bg-amber-500"
+                            : "bg-emerald-500",
+                      )}
+                      initial={{ width: 0 }}
+                      animate={{ width: `${Math.min(100, (usageCount / usageLimit) * 100)}%` }}
+                      transition={{ duration: 0.6, ease: "easeOut" }}
+                    />
+                  </div>
+                  {usageCount >= usageLimit && (
+                    <div className="mt-3 flex items-center gap-3 rounded-[18px] border border-amber-200 bg-amber-50 px-4 py-3">
+                      <AlertCircle className="h-4 w-4 shrink-0 text-amber-600" />
+                      <p className="text-xs text-amber-800">
+                        You've used all {usageLimit} free predictions today. <span className="font-semibold">Upgrade to Pro</span> for unlimited access.
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -3371,6 +3506,218 @@ export default function Home() {
                 </motion.div>
               </AnimatePresence>
             </div>
+          )}
+
+          {/* ── User Feedback Panel ── */}
+          {session && activeResult && (
+            <motion.div
+              initial={{ opacity: 0, y: 18 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5, delay: 0.15 }}
+              className="mt-10"
+            >
+              <div className="relative overflow-hidden rounded-[36px] border border-violet-300/30 bg-[radial-gradient(circle_at_top_left,rgba(139,92,246,0.18),transparent_38%),radial-gradient(circle_at_bottom_right,rgba(59,130,246,0.14),transparent_32%),linear-gradient(155deg,rgba(255,255,255,0.92),rgba(245,243,255,0.88),rgba(240,245,255,0.92))] p-6 shadow-[0_30px_100px_-50px_rgba(109,40,217,0.35)] backdrop-blur">
+                <div className="pointer-events-none absolute inset-x-6 top-0 h-px bg-gradient-to-r from-transparent via-violet-400/50 to-transparent" />
+
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div>
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-violet-600">
+                      <MessageSquare className="h-4 w-4" />
+                      Your market intel
+                    </div>
+                    <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-950">
+                      Share your read on {activeResult.ticker}
+                    </h2>
+                    <p className="mt-2 max-w-2xl text-sm leading-7 text-slate-600">
+                      Help us improve by telling us whether you agree with the model, what you think the
+                      direction will be, and how confident you are. Your feedback trains smarter signals.
+                    </p>
+                  </div>
+                  {feedbackSuccess && (
+                    <div className="flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-700">
+                      <CheckCircle className="h-4 w-4" />
+                      Submitted
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-6 grid gap-6 lg:grid-cols-3">
+                  {/* Direction */}
+                  <div className="rounded-[28px] border border-violet-200/60 bg-white/80 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                      <TrendingUp className="h-3.5 w-3.5" />
+                      Your prediction
+                    </div>
+                    <p className="mt-2 text-sm text-slate-600">
+                      Model says <span className={clsx("font-semibold", activeResult.prediction === "Up" ? "text-emerald-700" : "text-rose-700")}>{activeResult.prediction}</span>.
+                      Do you agree?
+                    </p>
+                    <div className="mt-4 flex gap-3">
+                      <button
+                        onClick={() => setFeedbackDirection("Up")}
+                        className={clsx(
+                          "flex flex-1 items-center justify-center gap-2 rounded-[20px] border-2 px-4 py-3.5 text-sm font-semibold transition-all duration-200",
+                          feedbackDirection === "Up"
+                            ? "border-emerald-400 bg-emerald-50 text-emerald-700 shadow-[0_8px_24px_-10px_rgba(16,185,129,0.4)]"
+                            : "border-slate-200 bg-white text-slate-600 hover:border-emerald-300 hover:bg-emerald-50/50",
+                        )}
+                      >
+                        <ThumbsUp className="h-4 w-4" />
+                        Up
+                      </button>
+                      <button
+                        onClick={() => setFeedbackDirection("Down")}
+                        className={clsx(
+                          "flex flex-1 items-center justify-center gap-2 rounded-[20px] border-2 px-4 py-3.5 text-sm font-semibold transition-all duration-200",
+                          feedbackDirection === "Down"
+                            ? "border-rose-400 bg-rose-50 text-rose-700 shadow-[0_8px_24px_-10px_rgba(244,63,94,0.4)]"
+                            : "border-slate-200 bg-white text-slate-600 hover:border-rose-300 hover:bg-rose-50/50",
+                        )}
+                      >
+                        <ThumbsDown className="h-4 w-4" />
+                        Down
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Sentiment */}
+                  <div className="rounded-[28px] border border-violet-200/60 bg-white/80 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                      <Sparkles className="h-3.5 w-3.5" />
+                      Market sentiment
+                    </div>
+                    <p className="mt-2 text-sm text-slate-600">
+                      How do you read the overall market right now?
+                    </p>
+                    <div className="mt-4 flex gap-2">
+                      {(["bullish", "neutral", "bearish"] as const).map((s) => (
+                        <button
+                          key={s}
+                          onClick={() => setFeedbackSentiment(s)}
+                          className={clsx(
+                            "flex-1 rounded-[18px] border-2 px-3 py-3 text-sm font-semibold capitalize transition-all duration-200",
+                            feedbackSentiment === s
+                              ? s === "bullish"
+                                ? "border-emerald-400 bg-emerald-50 text-emerald-700 shadow-[0_6px_20px_-8px_rgba(16,185,129,0.4)]"
+                                : s === "bearish"
+                                  ? "border-rose-400 bg-rose-50 text-rose-700 shadow-[0_6px_20px_-8px_rgba(244,63,94,0.4)]"
+                                  : "border-amber-400 bg-amber-50 text-amber-700 shadow-[0_6px_20px_-8px_rgba(245,158,11,0.4)]"
+                              : "border-slate-200 bg-white text-slate-500 hover:border-slate-300 hover:bg-slate-50",
+                          )}
+                        >
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Confidence */}
+                  <div className="rounded-[28px] border border-violet-200/60 bg-white/80 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                      <Star className="h-3.5 w-3.5" />
+                      Confidence level
+                    </div>
+                    <p className="mt-2 text-sm text-slate-600">
+                      How sure are you about your call? (1 = guess, 5 = very confident)
+                    </p>
+                    <div className="mt-4 flex gap-2">
+                      {[1, 2, 3, 4, 5].map((level) => (
+                        <button
+                          key={level}
+                          onClick={() => setFeedbackConfidence(level)}
+                          className={clsx(
+                            "flex h-12 w-12 items-center justify-center rounded-2xl border-2 text-sm font-bold transition-all duration-200",
+                            feedbackConfidence === level
+                              ? "border-violet-400 bg-violet-50 text-violet-700 shadow-[0_6px_20px_-8px_rgba(139,92,246,0.5)] scale-110"
+                              : "border-slate-200 bg-white text-slate-500 hover:border-violet-300 hover:bg-violet-50/50",
+                          )}
+                        >
+                          {level}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Comment + Submit */}
+                <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_auto]">
+                  <div className="rounded-[24px] border border-violet-200/50 bg-white/80 p-4">
+                    <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                      <MessageSquare className="h-3.5 w-3.5" />
+                      Optional comment
+                    </label>
+                    <textarea
+                      value={feedbackComment}
+                      onChange={(event) => setFeedbackComment(event.target.value)}
+                      placeholder="Any specific reasoning, news you've seen, or trade thesis…"
+                      rows={2}
+                      maxLength={2000}
+                      className="mt-2 w-full resize-none bg-transparent text-sm leading-6 text-slate-900 outline-none placeholder:text-slate-400"
+                    />
+                  </div>
+                  <button
+                    disabled={feedbackSubmitting || (!feedbackDirection && !feedbackSentiment)}
+                    onClick={async () => {
+                      if (!activeResult || !session?.user?.email) return;
+                      setFeedbackSubmitting(true);
+                      setFeedbackError(null);
+                      setFeedbackSuccess(false);
+                      try {
+                        const res = await fetch("/api/feedback", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            ticker: activeResult.ticker,
+                            request_id: activeResult.request_id,
+                            feedback_type: feedbackDirection ? "prediction_rating" : "market_sentiment",
+                            model_prediction: activeResult.prediction,
+                            user_prediction: feedbackDirection,
+                            confidence_rating: feedbackConfidence,
+                            sentiment_label: feedbackSentiment,
+                            comment: feedbackComment.trim() || null,
+                            predicted_at: activeResult.predicted_at,
+                            model_confidence: activeResult.confidence,
+                          }),
+                        });
+                        if (!res.ok) {
+                          const data = await res.json().catch(() => ({ error: "Submission failed." }));
+                          throw new Error((data as { error?: string }).error || "Submission failed.");
+                        }
+                        setFeedbackSuccess(true);
+                        setFeedbackDirection(null);
+                        setFeedbackSentiment(null);
+                        setFeedbackConfidence(3);
+                        setFeedbackComment("");
+                        setTimeout(() => setFeedbackSuccess(false), 5000);
+                      } catch (err: unknown) {
+                        setFeedbackError(err instanceof Error ? err.message : "Submission failed.");
+                      } finally {
+                        setFeedbackSubmitting(false);
+                      }
+                    }}
+                    className={clsx(
+                      "flex items-center justify-center gap-2 self-end rounded-[22px] px-8 py-4 text-sm font-semibold transition-all duration-200",
+                      feedbackSubmitting || (!feedbackDirection && !feedbackSentiment)
+                        ? "cursor-not-allowed border-2 border-slate-200 bg-slate-100 text-slate-400"
+                        : "border-2 border-violet-400/60 bg-[linear-gradient(135deg,rgba(139,92,246,0.92),rgba(79,70,229,0.95))] text-white shadow-[0_12px_36px_-12px_rgba(139,92,246,0.6)] hover:shadow-[0_16px_48px_-12px_rgba(139,92,246,0.7)] hover:brightness-110",
+                    )}
+                  >
+                    {feedbackSubmitting ? (
+                      <><Loader2 className="h-4 w-4 animate-spin" /> Submitting…</>
+                    ) : (
+                      <><Send className="h-4 w-4" /> Submit feedback</>
+                    )}
+                  </button>
+                </div>
+
+                {feedbackError && (
+                  <div className="mt-4 rounded-[20px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                    <AlertCircle className="mr-2 inline-block h-4 w-4" />
+                    {feedbackError}
+                  </div>
+                )}
+              </div>
+            </motion.div>
           )}
 
           <div className="mt-10 grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
