@@ -48,6 +48,7 @@ class AgentVerdict(BaseModel):
     confidence_delta: float
     conviction: Literal["low", "medium", "high"]
     thesis: str
+    public_notes: list[str] = Field(default_factory=list)
     key_signals: list[str] = Field(default_factory=list)
     rebuttals: dict[str, str] = Field(default_factory=dict)
     agrees_with_model: bool

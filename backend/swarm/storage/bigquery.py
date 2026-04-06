@@ -215,6 +215,7 @@ class SwarmRepository:
     def _round_row(self, verdict: AgentVerdict) -> dict[str, Any]:
         payload = verdict.model_dump(mode="json")
         payload.pop("display_name", None)
+        payload.pop("public_notes", None)
         payload["key_signals"] = json.dumps(payload.get("key_signals", []))
         payload["rebuttals"] = json.dumps(payload.get("rebuttals", {}))
         return payload

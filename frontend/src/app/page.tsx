@@ -153,6 +153,7 @@ interface SwarmVerdictEvent {
   conviction: "low" | "medium" | "high";
   thesis: string;
   agrees_with_model: boolean;
+  public_notes?: string[];
   key_signals?: string[];
   rebuttals?: Record<string, string>;
   revised?: boolean;
@@ -1210,6 +1211,16 @@ function SwarmAnalysisPanel({
   archivedAt?: string | null;
   nowMs?: number;
 }) {
+  type DiscussionMessage = {
+    id: string;
+    speaker: string;
+    role: "agent" | "moderator";
+    stage: string;
+    body: string;
+    meta: string;
+    at: string;
+  };
+
   const [selectedRoundOverride, setSelectedRoundOverride] = useState<SwarmRoundView | null>(null);
   const agents = Object.values(swarm?.agents ?? {});
   const hasRound2 = agents.some((agent) => Boolean(agent.round2));
@@ -1220,6 +1231,108 @@ function SwarmAnalysisPanel({
   const showAskPanel =
     variant === "live" &&
     Boolean(swarm?.deliberationId && onAsk && setInterviewAgent && setInterviewQuestion);
+
+  const discussionMessages: DiscussionMessage[] = (swarm?.logs ?? []).flatMap<DiscussionMessage>((entry) => {
+    if (entry.kind !== "stream" || !entry.payload) {
+      return [];
+    }
+
+    const payload = entry.payload;
+    if (typeof payload.note === "string") {
+      const round = Number(payload.round) === 2 ? "round2" : "round1";
+      if (selectedRound === "final" ? round !== "round2" : selectedRound !== round) {
+        return [];
+      }
+      return [{
+        id: `${entry.id}-note`,
+        speaker: String(payload.agent ?? "Agent"),
+        role: "agent",
+        stage: `Thought ${String(payload.index ?? "1")}`,
+        body: payload.note,
+        meta: round === "round2" ? "Public reasoning note · rebuttal round" : "Public reasoning note · opening round",
+        at: entry.at,
+      }];
+    }
+
+    if (typeof payload.message === "string" && typeof payload.status === "string") {
+      const round = Number(payload.round) === 2 ? "round2" : "round1";
+      if (selectedRound === "final" ? round !== "round2" : selectedRound !== round) {
+        return [];
+      }
+      return [{
+        id: `${entry.id}-status`,
+        speaker: String(payload.agent ?? "Agent"),
+        role: "agent",
+        stage: String(payload.status),
+        body: payload.message,
+        meta: round === "round2" ? "Live room update · rebuttal round" : "Live room update · opening round",
+        at: entry.at,
+      }];
+    }
+
+    const roundLabel = entry.title.includes("Round 1")
+      ? "round1"
+      : entry.title.includes("Round 2")
+        ? "round2"
+        : entry.title === "Moderator verdict"
+          ? "final"
+          : null;
+
+    if (selectedRound === "round1" && roundLabel !== "round1") {
+      return [];
+    }
+    if (selectedRound === "round2" && roundLabel !== "round2") {
+      return [];
+    }
+    if (selectedRound === "final" && roundLabel !== "round2" && roundLabel !== "final") {
+      return [];
+    }
+
+    if (roundLabel === "final") {
+      return [{
+        id: `${entry.id}-moderator`,
+        speaker: "Moderator",
+        role: "moderator" as const,
+        stage: "Final call",
+        body: `${String(payload.final_direction ?? "Pending")} at ${typeof payload.final_confidence === "number" ? `${((payload.final_confidence as number) * 100).toFixed(1)}% confidence` : "unknown confidence"}. ${String(payload.consensus ?? "")}`,
+        meta: payload.direction_overridden ? "Override" : "Consensus",
+        at: entry.at,
+      }];
+    }
+
+    const speaker = String(payload.agent ?? "Agent");
+    const direction = String(payload.direction ?? "Pending");
+    const conviction = String(payload.conviction ?? "unknown");
+    const thesis = String(payload.thesis ?? "");
+    const baseMessage = {
+      id: `${entry.id}-thesis`,
+      speaker,
+      role: "agent" as const,
+      stage: roundLabel === "round1" ? "Opening take" : "Updated take",
+      body: thesis,
+      meta: `${direction} · ${conviction}`,
+      at: entry.at,
+    };
+
+    if (roundLabel === "round1") {
+      return [baseMessage];
+    }
+
+    const rebuttals =
+      payload.rebuttals && typeof payload.rebuttals === "object"
+        ? Object.entries(payload.rebuttals).map(([target, message], index) => ({
+          id: `${entry.id}-rebuttal-${index}`,
+          speaker,
+          role: "agent" as const,
+          stage: `Challenge to ${target}`,
+          body: String(message),
+          meta: `${direction} · ${conviction}`,
+          at: entry.at,
+        }))
+        : [];
+
+    return [baseMessage, ...rebuttals];
+  });
 
   const renderAgentCard = (agent: SwarmAgentState, round: SwarmRoundView) => {
     if (round === "final") {
@@ -1441,6 +1554,87 @@ function SwarmAnalysisPanel({
             >
               Final call
             </button>
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-[22px] border border-cyan-300/15 bg-slate-950/20 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-white">
+                {variant === "archive" ? "Replay transcript" : "Live conversation"}
+              </div>
+              <p className="mt-1 text-sm text-slate-200/75">
+                {selectedRound === "round1"
+                  ? "Opening takes land here one by one."
+                  : selectedRound === "round2"
+                    ? "Rebuttals and revised views stream here as the agents answer each other."
+                    : "Final positions and the moderator close-out in one readable thread."}
+              </p>
+            </div>
+            <span className="rounded-full border border-cyan-300/20 bg-cyan-400/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100/90">
+              {discussionMessages.length} messages
+            </span>
+          </div>
+
+          <div className="mt-4 max-h-[28rem] space-y-3 overflow-y-auto pr-1">
+            {discussionMessages.length > 0 ? (
+              <AnimatePresence initial={false}>
+                {discussionMessages.map((message) => (
+                  <motion.div
+                    key={message.id}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    transition={{ duration: 0.18 }}
+                    className={clsx(
+                      "rounded-[20px] border px-4 py-3",
+                      message.role === "moderator"
+                        ? "border-fuchsia-300/25 bg-fuchsia-400/10"
+                        : "border-cyan-300/18 bg-white/7",
+                    )}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={clsx(
+                            "rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em]",
+                            message.role === "moderator"
+                              ? "bg-fuchsia-200/20 text-fuchsia-100"
+                              : "bg-cyan-200/15 text-cyan-100",
+                          )}
+                        >
+                          {message.speaker}
+                        </span>
+                        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-300/80">
+                          {message.stage}
+                        </span>
+                      </div>
+                      <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-300/70">
+                        {formatSwarmLogTime(message.at)}
+                      </span>
+                    </div>
+                    <p className="mt-3 text-sm leading-6 text-slate-100/90">{message.body}</p>
+                    <div className="mt-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-300/75">
+                      {message.meta}
+                    </div>
+                  </motion.div>
+                ))}
+              </AnimatePresence>
+            ) : variant === "live" && swarm?.status === "streaming" ? (
+              <div className="space-y-3">
+                {Array.from({ length: 4 }).map((_, index) => (
+                  <div key={index} className="animate-pulse rounded-[20px] border border-cyan-300/12 bg-white/6 px-4 py-3">
+                    <div className="h-3 w-28 rounded bg-cyan-200/15" />
+                    <div className="mt-3 h-3 w-full rounded bg-white/10" />
+                    <div className="mt-2 h-3 w-5/6 rounded bg-white/10" />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-[18px] border border-cyan-300/15 bg-white/6 px-4 py-3 text-sm text-slate-200/75">
+                Swarm messages will appear here as soon as the selected round has content.
+              </div>
+            )}
           </div>
         </div>
 
@@ -2403,6 +2597,22 @@ export default function Home() {
     eventName: string,
     payload: Record<string, unknown>,
   ): Omit<SwarmLogEntry, "id" | "at"> => {
+    if (eventName === "agent_status") {
+      return {
+        kind: "stream",
+        title: `${String(payload.agent ?? "Agent")} · ${Number(payload.round) === 2 ? "Round 2" : "Round 1"} status`,
+        detail: String(payload.message ?? "Agent status update."),
+        payload,
+      };
+    }
+    if (eventName === "agent_note") {
+      return {
+        kind: "stream",
+        title: `${String(payload.agent ?? "Agent")} · thought ${String(payload.index ?? "1")}`,
+        detail: String(payload.note ?? "Agent note."),
+        payload,
+      };
+    }
     if (eventName === "round1_verdict") {
       return {
         kind: "stream",
@@ -2477,6 +2687,9 @@ export default function Home() {
           conviction: String(payload.conviction ?? "medium") as "low" | "medium" | "high",
           thesis: String(payload.thesis ?? ""),
           agrees_with_model: Boolean(payload.agrees_with_model),
+          public_notes: Array.isArray(payload.public_notes)
+            ? payload.public_notes.map((value) => String(value))
+            : undefined,
           key_signals: Array.isArray(payload.key_signals)
             ? payload.key_signals.map((value) => String(value))
             : undefined,
