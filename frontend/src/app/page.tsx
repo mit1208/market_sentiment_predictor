@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
@@ -980,27 +981,6 @@ function getCacheTone(cacheStatus: CacheStatus | null | undefined) {
   };
 }
 
-function getAverageNewsAgeHours(items: NewsItem[], nowMs: number): number | null {
-  const ageHours = items
-    .map((item) => {
-      if (!item.published_at) {
-        return null;
-      }
-      const publishedAtMs = new Date(item.published_at).getTime();
-      if (Number.isNaN(publishedAtMs)) {
-        return null;
-      }
-      return Math.max(0, (nowMs - publishedAtMs) / (1000 * 60 * 60));
-    })
-    .filter((value): value is number => value !== null);
-
-  if (ageHours.length === 0) {
-    return null;
-  }
-
-  return ageHours.reduce((sum, value) => sum + value, 0) / ageHours.length;
-}
-
 function normalizeHeadline(headline: string): string {
   return headline
     .toLowerCase()
@@ -1238,38 +1218,6 @@ function SwarmAnalysisPanel({
     }
 
     const payload = entry.payload;
-    if (typeof payload.note === "string") {
-      const round = Number(payload.round) === 2 ? "round2" : "round1";
-      if (selectedRound === "final" ? round !== "round2" : selectedRound !== round) {
-        return [];
-      }
-      return [{
-        id: `${entry.id}-note`,
-        speaker: String(payload.agent ?? "Agent"),
-        role: "agent",
-        stage: `Thought ${String(payload.index ?? "1")}`,
-        body: payload.note,
-        meta: round === "round2" ? "Public reasoning note · rebuttal round" : "Public reasoning note · opening round",
-        at: entry.at,
-      }];
-    }
-
-    if (typeof payload.message === "string" && typeof payload.status === "string") {
-      const round = Number(payload.round) === 2 ? "round2" : "round1";
-      if (selectedRound === "final" ? round !== "round2" : selectedRound !== round) {
-        return [];
-      }
-      return [{
-        id: `${entry.id}-status`,
-        speaker: String(payload.agent ?? "Agent"),
-        role: "agent",
-        stage: String(payload.status),
-        body: payload.message,
-        meta: round === "round2" ? "Live room update · rebuttal round" : "Live room update · opening round",
-        at: entry.at,
-      }];
-    }
-
     const roundLabel = entry.title.includes("Round 1")
       ? "round1"
       : entry.title.includes("Round 2")
@@ -1284,18 +1232,20 @@ function SwarmAnalysisPanel({
     if (selectedRound === "round2" && roundLabel !== "round2") {
       return [];
     }
-    if (selectedRound === "final" && roundLabel !== "round2" && roundLabel !== "final") {
+    if (selectedRound === "final" && roundLabel !== "final") {
       return [];
     }
 
     if (roundLabel === "final") {
+      const directionSummary = `${String(payload.final_direction ?? "Pending")} at ${typeof payload.final_confidence === "number" ? `${((payload.final_confidence as number) * 100).toFixed(1)}% confidence` : "unknown confidence"}`;
+      const consensusSummary = typeof payload.consensus === "string" ? payload.consensus : "";
       return [{
         id: `${entry.id}-moderator`,
         speaker: "Moderator",
         role: "moderator" as const,
-        stage: "Final call",
-        body: `${String(payload.final_direction ?? "Pending")} at ${typeof payload.final_confidence === "number" ? `${((payload.final_confidence as number) * 100).toFixed(1)}% confidence` : "unknown confidence"}. ${String(payload.consensus ?? "")}`,
-        meta: payload.direction_overridden ? "Override" : "Consensus",
+        stage: "Final conclusion",
+        body: [directionSummary, consensusSummary].filter(Boolean).join(". "),
+        meta: payload.direction_overridden ? "Override applied" : "Consensus close",
         at: entry.at,
       }];
     }
@@ -1308,7 +1258,7 @@ function SwarmAnalysisPanel({
       id: `${entry.id}-thesis`,
       speaker,
       role: "agent" as const,
-      stage: roundLabel === "round1" ? "Opening take" : "Updated take",
+      stage: roundLabel === "round1" ? "Round 1 final thought" : "Round 2 final thought",
       body: thesis,
       meta: `${direction} · ${conviction}`,
       at: entry.at,
@@ -1318,20 +1268,7 @@ function SwarmAnalysisPanel({
       return [baseMessage];
     }
 
-    const rebuttals =
-      payload.rebuttals && typeof payload.rebuttals === "object"
-        ? Object.entries(payload.rebuttals).map(([target, message], index) => ({
-          id: `${entry.id}-rebuttal-${index}`,
-          speaker,
-          role: "agent" as const,
-          stage: `Challenge to ${target}`,
-          body: String(message),
-          meta: `${direction} · ${conviction}`,
-          at: entry.at,
-        }))
-        : [];
-
-    return [baseMessage, ...rebuttals];
+    return [baseMessage];
   });
 
   const renderAgentCard = (agent: SwarmAgentState, round: SwarmRoundView) => {
@@ -1370,7 +1307,7 @@ function SwarmAnalysisPanel({
 
           <div className="mt-4 rounded-[18px] border border-white/10 bg-slate-950/35 p-3">
             <div className="flex items-center justify-between gap-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-200/65">
-              <span>Closing position</span>
+              <span>Final thought</span>
               {agent.round2?.revised && <span className="text-amber-300">Changed view</span>}
             </div>
             <p className="mt-2 text-sm leading-6 text-slate-100/85">
@@ -1382,7 +1319,7 @@ function SwarmAnalysisPanel({
     }
 
     const verdict = round === "round2" ? agent.round2 : agent.round1;
-    const heading = round === "round2" ? "Round 2 response" : "Round 1 opening";
+    const heading = round === "round2" ? "Round 2 final thought" : "Round 1 final thought";
     const emptyCopy = round === "round2" ? "Waiting for the rebuttal round…" : "Waiting for first-pass verdict…";
 
     return (
@@ -1426,26 +1363,6 @@ function SwarmAnalysisPanel({
               {verdict?.thesis ?? emptyCopy}
             </p>
           </div>
-
-          {round === "round1" && agent.round1?.key_signals && agent.round1.key_signals.length > 0 && (
-            <div className="flex flex-wrap gap-2">
-              {agent.round1.key_signals.map((signal) => (
-                <span key={signal} className="rounded-full border border-cyan-300/25 bg-cyan-400/10 px-2.5 py-1 text-[11px] font-semibold text-cyan-100">
-                  {signal}
-                </span>
-              ))}
-            </div>
-          )}
-
-          {round === "round2" && agent.round2?.rebuttals && Object.keys(agent.round2.rebuttals).length > 0 && (
-            <div className="space-y-2">
-              {Object.entries(agent.round2.rebuttals).map(([label, message]) => (
-                <div key={label} className="rounded-[16px] border border-cyan-300/15 bg-white/6 px-3 py-2 text-xs leading-5 text-slate-200/80">
-                  <span className="font-semibold text-cyan-100">{label}:</span> {message}
-                </div>
-              ))}
-            </div>
-          )}
         </div>
       </div>
     );
@@ -1479,12 +1396,12 @@ function SwarmAnalysisPanel({
               saved {formatRelativeTime(archivedAt, nowMs ?? 0)}
             </span>
           )}
-          {onRetry && (
+          {onRetry && (!swarm || swarm.status === "error") && (
             <button
               onClick={onRetry}
               className="rounded-full border border-cyan-300/30 bg-[linear-gradient(135deg,rgba(34,211,238,0.28),rgba(59,130,246,0.28))] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110"
             >
-              {variant === "archive" ? "Run fresh analysis" : swarm ? "Re-run analysis" : "Run analysis"}
+              {variant === "archive" ? "Run fresh analysis" : swarm ? "Try again" : "Run analysis"}
             </button>
           )}
         </div>
@@ -1565,10 +1482,10 @@ function SwarmAnalysisPanel({
               </div>
               <p className="mt-1 text-sm text-slate-200/75">
                 {selectedRound === "round1"
-                  ? "Opening takes land here one by one."
+                  ? "Each agent's round 1 closing thought lands here."
                   : selectedRound === "round2"
-                    ? "Rebuttals and revised views stream here as the agents answer each other."
-                    : "Final positions and the moderator close-out in one readable thread."}
+                    ? "Each agent's round 2 closing thought lands here."
+                    : "The moderator's final conclusion lands here."}
               </p>
             </div>
             <span className="rounded-full border border-cyan-300/20 bg-cyan-400/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100/90">
@@ -1661,7 +1578,7 @@ function SwarmAnalysisPanel({
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <div className="text-xs font-semibold uppercase tracking-[0.18em] text-fuchsia-100/70">
-                Moderator verdict
+                Final conclusion
               </div>
               <div className="mt-2 text-2xl font-semibold tracking-tight">
                 {swarm.moderator.final_direction} · {(swarm.moderator.final_confidence * 100).toFixed(1)}%
@@ -1692,7 +1609,7 @@ function SwarmAnalysisPanel({
               Live swarm log
             </div>
             <p className="mt-1 text-sm text-slate-200/75">
-              Every streamed event stays visible here so you never lose the reasoning trail.
+              The full stream stays here for audit and debugging, while the round view above keeps only the conclusions.
             </p>
           </div>
           <span className="rounded-full border border-cyan-300/20 bg-cyan-400/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100/90">
@@ -2363,6 +2280,7 @@ export default function Home() {
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
   const [usageCount, setUsageCount] = useState(0);
   const [usageLimit, setUsageLimit] = useState(3);
+  const [usedTickersToday, setUsedTickersToday] = useState<string[]>([]);
   const [usageLoaded, setUsageLoaded] = useState(false);
   const [archiveHistoryKey, setArchiveHistoryKey] = useState<string | null>(null);
   const [archivedSwarm, setArchivedSwarm] = useState<SwarmTickerState | null>(null);
@@ -2371,6 +2289,7 @@ export default function Home() {
   const autoBootstrapped = useRef(false);
   const swarmAbortControllers = useRef<Record<string, AbortController>>({});
   const swarmArchiveLoads = useRef<Record<string, boolean>>({});
+  const activeSwarmPanelRef = useRef<HTMLDivElement | null>(null);
   const totalTickerCount = tickers.length;
 
   function getResultKey(result: Pick<PredictionResult, "request_id" | "ticker">) {
@@ -2447,6 +2366,13 @@ export default function Home() {
         const data = await res.json();
         setUsageCount(data.prediction_count ?? 0);
         setUsageLimit(data.daily_limit ?? 3);
+        setUsedTickersToday(
+          Array.isArray(data.used_tickers)
+            ? data.used_tickers
+                .map((value: unknown) => (typeof value === "string" ? value.trim().toUpperCase() : ""))
+                .filter((value: string) => Boolean(value))
+            : [],
+        );
       }
     } catch {
       // silently fail
@@ -2464,6 +2390,7 @@ export default function Home() {
     } else {
       setHistory([]);
       setUsageCount(0);
+      setUsedTickersToday([]);
       setUsageLoaded(true);
       setTickers((prev) => {
         const guestTickers = prev.filter((tickerItem) => isDefaultTicker(tickerItem));
@@ -2755,6 +2682,7 @@ export default function Home() {
       return;
     }
 
+    activeSwarmPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     setError(null);
     const existing = swarmAbortControllers.current[result.ticker];
     existing?.abort();
@@ -2990,6 +2918,11 @@ export default function Home() {
   const activeSwarm = activeResult ? swarmByTicker[activeResult.ticker] ?? null : null;
   const selectedArchiveItem =
     archiveHistoryKey ? history.find((item) => buildHistoryKey(item) === archiveHistoryKey) ?? null : null;
+  const projectedUsageCount = session?.user?.email
+    ? new Set([...usedTickersToday, ...tickers.map((tickerItem) => tickerItem.toUpperCase())]).size
+    : 0;
+  const wouldExceedDailyTickerLimit =
+    Boolean(session?.user?.email) && usageLoaded && projectedUsageCount > usageLimit;
 
   useEffect(() => {
     if (analysisMode !== "deep" || !activeResult) {
@@ -3008,6 +2941,18 @@ export default function Home() {
     }
     runSwarmEffect(activeResult);
   }, [analysisMode, activeResult, history, swarmByTicker]);
+
+  useEffect(() => {
+    if (analysisMode !== "deep" || !activeResult) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      activeSwarmPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 120);
+
+    return () => window.clearTimeout(timer);
+  }, [analysisMode, activeResult]);
 
   useEffect(() => {
     const availableAgents = Object.keys(activeSwarm?.agents ?? {});
@@ -3078,18 +3023,12 @@ export default function Home() {
   const spyChangePct = activeResult ? getNumericFeature(activeResult, "spy_change_pct") : null;
   const cacheStatus = activeResult?.feature_snapshot.cache_status ?? null;
   const cacheTone = getCacheTone(cacheStatus);
-  const avgNewsAgeHours = activeResult
-    ? getAverageNewsAgeHours(getDedupedNewsItems(activeResult.feature_snapshot.news_items), nowMs)
-    : null;
   const volumeVsAvg10d = activeResult
     ? getNumericFeature(activeResult, "volume_vs_avg_10d")
     : null;
   const priceVs50d = activeResult
     ? getNumericFeature(activeResult, "price_vs_50d_avg")
     : null;
-  const uniqueNewsCount = activeResult
-    ? getDedupedNewsItems(activeResult.feature_snapshot.news_items).length
-    : 0;
   const topDriverFeatures = activeResult
     ? (activeResult.model_quality?.top_features ?? [])
       .map((row) => getFeature(activeResult, row.feature))
@@ -3271,7 +3210,13 @@ export default function Home() {
                     <span className="text-[10px] text-slate-500">{session.user?.email}</span>
                   </div>
                   {session.user?.image ? (
-                    <img src={session.user.image} alt="" className="h-8 w-8 rounded-full border border-white" />
+                    <Image
+                      src={session.user.image}
+                      alt=""
+                      width={32}
+                      height={32}
+                      className="h-8 w-8 rounded-full border border-white"
+                    />
                   ) : (
                     <div className="flex h-8 w-8 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-400">
                       <User className="h-4 w-4" />
@@ -3380,15 +3325,15 @@ export default function Home() {
 
                 <button
                   onClick={predict}
-                  disabled={tickers.length === 0 || loading || !!(session && usageLoaded && usageCount >= usageLimit)}
+                  disabled={tickers.length === 0 || loading || wouldExceedDailyTickerLimit}
                   className="inline-flex items-center justify-center gap-2 rounded-[28px] bg-[linear-gradient(135deg,#0f766e,#0b3b5a)] px-5 py-4 text-sm font-semibold text-white transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   {loading ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      Running prediction
+                      Refreshing data
                     </>
-                  ) : usageLoaded && usageCount >= usageLimit ? (
+                  ) : wouldExceedDailyTickerLimit ? (
                     <>
                       <AlertCircle className="h-4 w-4" />
                       Daily limit reached
@@ -3396,7 +3341,7 @@ export default function Home() {
                   ) : (
                     <>
                       <Sparkles className="h-4 w-4" />
-                      Run prediction
+                      {results.length > 0 ? "Refresh data" : "Run prediction"}
                     </>
                   )}
                 </button>
@@ -3459,7 +3404,7 @@ export default function Home() {
                       Daily usage
                     </div>
                     <div className="text-xs font-semibold text-slate-600">
-                      {usageCount} / {usageLimit} predictions today
+                      {usageCount} / {usageLimit} tickers refreshed today
                     </div>
                   </div>
                   <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-100">
@@ -3477,11 +3422,31 @@ export default function Home() {
                       transition={{ duration: 0.6, ease: "easeOut" }}
                     />
                   </div>
+                  {usedTickersToday.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {usedTickersToday.map((usedTicker) => (
+                        <span
+                          key={usedTicker}
+                          className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-emerald-700"
+                        >
+                          {usedTicker}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {wouldExceedDailyTickerLimit && (
+                    <div className="mt-3 flex items-center gap-3 rounded-[18px] border border-rose-200 bg-rose-50 px-4 py-3">
+                      <AlertCircle className="h-4 w-4 shrink-0 text-rose-600" />
+                      <p className="text-xs text-rose-800">
+                        Free accounts can refresh up to {usageLimit} unique tickers per day. This selection would take today&apos;s total to {projectedUsageCount}.
+                      </p>
+                    </div>
+                  )}
                   {usageCount >= usageLimit && (
                     <div className="mt-3 flex items-center gap-3 rounded-[18px] border border-amber-200 bg-amber-50 px-4 py-3">
                       <AlertCircle className="h-4 w-4 shrink-0 text-amber-600" />
                       <p className="text-xs text-amber-800">
-                        You&apos;ve used all {usageLimit} free predictions today. <span className="font-semibold">Upgrade to Pro</span> for unlimited access.
+                        You&apos;ve used all {usageLimit} free tickers today. <span className="font-semibold">Upgrade to Pro</span> for unlimited access.
                       </p>
                     </div>
                   )}
@@ -3491,7 +3456,7 @@ export default function Home() {
               <div className="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
                 {analysisMode === "quick"
                   ? "Quick Predict returns the ML ensemble result only."
-                  : "Deep Analysis keeps the ML result, then streams a four-agent review for the active ticker."}
+                  : "Deep Analysis reuses the latest refreshed snapshot, then streams a four-agent review for the active ticker."}
               </div>
 
               <div className="mt-5 flex flex-wrap gap-2">
@@ -3735,7 +3700,7 @@ export default function Home() {
                     Your prediction history
                   </div>
                   <p className="mt-2 text-sm text-slate-600">
-                    Showing your last 50 predictions linked to your account.
+                    Showing the latest saved row for each ticker linked to your account.
                   </p>
                 </div>
                 {loadingHistory && <Loader2 className="h-4 w-4 animate-spin text-slate-400" />}
@@ -3760,7 +3725,7 @@ export default function Home() {
                       {history.length > 0 ? (
                         history.map((item, idx) => (
                           <tr
-                            key={`${item.request_id}-${idx}`}
+                            key={`${buildHistoryKey(item)}-${idx}`}
                             className={clsx(
                               "group hover:bg-slate-50/40",
                               archiveHistoryKey === buildHistoryKey(item) && "bg-cyan-50/50",
@@ -3973,18 +3938,20 @@ export default function Home() {
                     <TopDriverCards driverFeatures={topDriverFeatures} />
 
                     {analysisMode === "deep" && (
-                    <SwarmAnalysisPanel
-                      ticker={activeResult.ticker}
-                      swarm={activeSwarm}
-                      onRetry={() => void startSwarmAnalysis(activeResult)}
-                      onAsk={() => void askSwarmAgent()}
+                    <div ref={activeSwarmPanelRef}>
+                      <SwarmAnalysisPanel
+                        ticker={activeResult.ticker}
+                        swarm={activeSwarm}
+                        onRetry={() => void startSwarmAnalysis(activeResult)}
+                        onAsk={() => void askSwarmAgent()}
                         interviewAgent={interviewAgent}
-                      setInterviewAgent={setInterviewAgent}
-                      interviewQuestion={interviewQuestion}
-                      setInterviewQuestion={setInterviewQuestion}
-                      interviewLoading={interviewLoading}
-                      nowMs={nowMs}
-                    />
+                        setInterviewAgent={setInterviewAgent}
+                        interviewQuestion={interviewQuestion}
+                        setInterviewQuestion={setInterviewQuestion}
+                        interviewLoading={interviewLoading}
+                        nowMs={nowMs}
+                      />
+                    </div>
                     )}
 
                     <div className="rounded-[32px] border border-white/70 bg-white/80 p-5 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.45)] backdrop-blur">
